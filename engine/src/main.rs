@@ -6,6 +6,8 @@ mod tt;
 use cozy_chess::util::{display_uci_move, parse_uci_move};
 use cozy_chess::Board;
 use search::{Limits, Searcher};
+use tt::TranspositionTable;
+use std::sync::atomic::AtomicU64;
 use std::io::{self, BufRead, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
@@ -21,6 +23,7 @@ enum Cmd {
     Position(Board, Vec<u64>),
     Go(Limits),
     SetHash(usize),
+    SetThreads(usize),
     UseNnue(bool),
     Bench(i32),
     Eval,
@@ -88,20 +91,66 @@ fn parse_go(tokens: &[&str]) -> Limits {
 }
 
 fn search_thread(rx: mpsc::Receiver<Cmd>, stop: Arc<AtomicBool>) {
-    let mut searcher = Searcher::new(DEFAULT_HASH_MB, stop.clone());
+    let mut tt = Arc::new(TranspositionTable::new(DEFAULT_HASH_MB));
+    let shared_nodes = Arc::new(AtomicU64::new(0));
+    let mut searcher = Searcher::new(tt.clone(), stop.clone(), shared_nodes.clone(), 0);
+    let mut helpers: Vec<Searcher> = Vec::new();
     let mut board = Board::startpos();
     let mut history: Vec<u64> = Vec::new();
     for cmd in rx {
         match cmd {
-            Cmd::NewGame => searcher.new_game(),
+            Cmd::NewGame => {
+                searcher.new_game();
+                for h in helpers.iter_mut() {
+                    h.new_game_local();
+                }
+            }
             Cmd::Position(b, h) => {
                 board = b;
                 history = h;
             }
-            Cmd::SetHash(mb) => searcher.tt.resize(mb),
-            Cmd::UseNnue(v) => searcher.use_nnue = v && searcher.net.is_some(),
+            Cmd::SetHash(mb) => {
+                // Helpers hold clones of the Arc; drop them so the table can be replaced.
+                let n = helpers.len();
+                helpers.clear();
+                match Arc::get_mut(&mut tt) {
+                    Some(t) => t.resize(mb),
+                    None => tt = Arc::new(TranspositionTable::new(mb)),
+                }
+                searcher.tt = tt.clone();
+                for i in 0..n {
+                    helpers.push(Searcher::new(tt.clone(), stop.clone(), shared_nodes.clone(), i + 1));
+                }
+            }
+            Cmd::SetThreads(n) => {
+                helpers.clear();
+                for i in 1..n {
+                    let mut h = Searcher::new(tt.clone(), stop.clone(), shared_nodes.clone(), i);
+                    h.use_nnue = searcher.use_nnue;
+                    helpers.push(h);
+                }
+            }
+            Cmd::UseNnue(v) => {
+                searcher.use_nnue = v && searcher.net.is_some();
+                for h in helpers.iter_mut() {
+                    h.use_nnue = v && h.net.is_some();
+                }
+            }
             Cmd::Go(limits) => {
-                let best = searcher.go(&board, &history, &limits);
+                let best = thread::scope(|s| {
+                    let helper_limits = Limits { infinite: true, depth: limits.depth, ..Default::default() };
+                    let board_ref = &board;
+                    let history_ref = &history;
+                    for h in helpers.iter_mut() {
+                        let hl = helper_limits.clone();
+                        s.spawn(move || {
+                            h.go(board_ref, history_ref, &hl);
+                        });
+                    }
+                    let best = searcher.go(&board, &history, &limits);
+                    stop.store(true, Ordering::Relaxed);
+                    best
+                });
                 match best {
                     Some(m) => println!("bestmove {}", display_uci_move(&board, m)),
                     None => println!("bestmove 0000"),
@@ -176,7 +225,7 @@ fn main() {
                 println!("id name {}", NAME);
                 println!("id author {}", AUTHOR);
                 println!("option name Hash type spin default {} min 1 max 4096", DEFAULT_HASH_MB);
-                println!("option name Threads type spin default 1 min 1 max 1");
+                println!("option name Threads type spin default 1 min 1 max 8");
                 println!("option name UseNNUE type check default true");
                 println!("uciok");
             }
@@ -193,6 +242,11 @@ fn main() {
                     let value = tokens[v + 1..].join(" ");
                     if name.eq_ignore_ascii_case("UseNNUE") {
                         tx.send(Cmd::UseNnue(value.eq_ignore_ascii_case("true"))).ok();
+                    }
+                    if name.eq_ignore_ascii_case("Threads") {
+                        if let Ok(n) = value.parse::<usize>() {
+                            tx.send(Cmd::SetThreads(n.clamp(1, 8))).ok();
+                        }
                     }
                     if name.eq_ignore_ascii_case("Hash") {
                         if let Ok(mb) = value.parse::<usize>() {

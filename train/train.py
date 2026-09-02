@@ -92,12 +92,15 @@ def main():
     ap.add_argument("--lr", type=float, default=1e-3)
     ap.add_argument("--threads", type=int, default=4)
     ap.add_argument("--resume", default=None)
+    ap.add_argument("--limit", type=int, default=0)
     args = ap.parse_args()
     torch.set_num_threads(args.threads)
     torch.manual_seed(0)
 
     d = np.load(args.data)
     pieces, stm, score = d["pieces"], d["stm"], d["score"].astype(np.float32)
+    if args.limit:
+        pieces, stm, score = pieces[: args.limit], stm[: args.limit], score[: args.limit]
     n = len(score)
     rng = np.random.default_rng(0)
     perm = rng.permutation(n)
