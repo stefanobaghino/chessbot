@@ -21,6 +21,7 @@ enum Cmd {
     Go(Limits),
     SetHash(usize),
     Bench(i32),
+    Eval,
     Quit,
 }
 
@@ -127,6 +128,10 @@ fn search_thread(rx: mpsc::Receiver<Cmd>, stop: Arc<AtomicBool>) {
                 println!("bench: {} nodes {} nps", total, total * 1000 / ms);
                 io::stdout().flush().ok();
             }
+            Cmd::Eval => {
+                println!("eval {}", searcher.static_eval(&board));
+                io::stdout().flush().ok();
+            }
             Cmd::Quit => break,
         }
     }
@@ -194,6 +199,9 @@ fn main() {
                 tx.send(Cmd::Go(parse_go(&tokens[1..]))).ok();
             }
             "stop" => stop.store(true, Ordering::Relaxed),
+            "eval" => {
+                tx.send(Cmd::Eval).ok();
+            }
             "quit" => {
                 stop.store(true, Ordering::Relaxed);
                 tx.send(Cmd::Quit).ok();

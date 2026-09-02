@@ -1,7 +1,7 @@
 //! Tapered evaluation based on PeSTO piece-square tables.
 //! Scores are from the side to move's perspective, in centipawns.
 
-use cozy_chess::{Board, Color, Piece, Square};
+use cozy_chess::{get_bishop_moves, get_king_moves, get_knight_moves, get_rook_moves, BitBoard, Board, Color, File, Piece, Rank, Square};
 
 pub const MG_VALUE: [i32; 6] = [82, 337, 365, 477, 1025, 0];
 pub const EG_VALUE: [i32; 6] = [94, 281, 297, 512, 936, 0];
@@ -142,16 +142,30 @@ const EG_KING: [i32; 64] = [
     -53, -34, -21, -11, -28, -14, -24, -43,
 ];
 
-/// PST[color][piece][square] for middlegame and endgame, material included.
+/// Precomputed tables: PSTs with material folded in, plus pawn-structure masks.
 pub struct Tables {
     pub mg: [[[i32; 64]; 6]; 2],
     pub eg: [[[i32; 64]; 6]; 2],
+    passed_mask: [[BitBoard; 64]; 2],
+    adjacent_files: [BitBoard; 8],
+    king_zone: [BitBoard; 64],
 }
+
+const FILE_BBS: [BitBoard; 8] = [
+    File::A.bitboard(), File::B.bitboard(), File::C.bitboard(), File::D.bitboard(),
+    File::E.bitboard(), File::F.bitboard(), File::G.bitboard(), File::H.bitboard(),
+];
 
 pub fn build_tables() -> Tables {
     let mg_src = [&MG_PAWN, &MG_KNIGHT, &MG_BISHOP, &MG_ROOK, &MG_QUEEN, &MG_KING];
     let eg_src = [&EG_PAWN, &EG_KNIGHT, &EG_BISHOP, &EG_ROOK, &EG_QUEEN, &EG_KING];
-    let mut t = Tables { mg: [[[0; 64]; 6]; 2], eg: [[[0; 64]; 6]; 2] };
+    let mut t = Tables {
+        mg: [[[0; 64]; 6]; 2],
+        eg: [[[0; 64]; 6]; 2],
+        passed_mask: [[BitBoard::EMPTY; 64]; 2],
+        adjacent_files: [BitBoard::EMPTY; 8],
+        king_zone: [BitBoard::EMPTY; 64],
+    };
     for p in 0..6 {
         for sq in 0..64 {
             // Source tables are laid out from a8; cozy squares index from a1.
@@ -162,11 +176,73 @@ pub fn build_tables() -> Tables {
             t.eg[1][p][sq] = EG_VALUE[p] + eg_src[p][sq];
         }
     }
+    for f in 0..8 {
+        let mut bb = BitBoard::EMPTY;
+        if f > 0 {
+            bb |= FILE_BBS[f - 1];
+        }
+        if f < 7 {
+            bb |= FILE_BBS[f + 1];
+        }
+        t.adjacent_files[f] = bb;
+    }
+    for sq in Square::ALL {
+        let f = sq.file() as usize;
+        let files = FILE_BBS[f] | t.adjacent_files[f];
+        t.passed_mask[0][sq as usize] = front_span_fast(sq, Color::White) & files;
+        t.passed_mask[1][sq as usize] = front_span_fast(sq, Color::Black) & files;
+        let mut zone = get_king_moves(sq) | sq.bitboard();
+        // Extend the zone one rank further towards the centre so that pieces
+        // aiming at the squares in front of the king count as attackers.
+        let shifted = match sq.rank() {
+            Rank::First | Rank::Second => zone.0 << 8,
+            Rank::Seventh | Rank::Eighth => zone.0 >> 8,
+            _ => 0,
+        };
+        zone |= BitBoard(shifted);
+        t.king_zone[sq as usize] = zone;
+    }
     t
 }
 
-pub fn phase_of(piece: Piece) -> i32 {
-    PHASE_INC[piece as usize]
+const PASSED_MG: [i32; 8] = [0, 4, 8, 18, 34, 60, 100, 0];
+const PASSED_EG: [i32; 8] = [0, 12, 22, 38, 62, 100, 150, 0];
+const ISOLATED: (i32, i32) = (-12, -16);
+const DOUBLED: (i32, i32) = (-10, -22);
+const BISHOP_PAIR: (i32, i32) = (28, 48);
+const ROOK_OPEN: (i32, i32) = (26, 10);
+const ROOK_SEMI: (i32, i32) = (12, 6);
+const ROOK_SEVENTH: (i32, i32) = (18, 28);
+const KNIGHT_MOB: (i32, i32) = (5, 4);
+const BISHOP_MOB: (i32, i32) = (5, 5);
+const ROOK_MOB: (i32, i32) = (2, 4);
+const QUEEN_MOB: (i32, i32) = (1, 3);
+const SHIELD_PAWN: i32 = 10;
+const OPEN_FILE_NEAR_KING: i32 = -18;
+const ATTACK_WEIGHT: [i32; 6] = [0, 2, 2, 3, 5, 0];
+
+#[rustfmt::skip]
+const SAFETY_TABLE: [i32; 100] = [
+      0,   0,   1,   2,   3,   5,   7,   9,  11,  13,
+     15,  17,  20,  23,  26,  30,  34,  38,  42,  46,
+     50,  55,  60,  65,  70,  75,  80,  85,  90,  95,
+    100, 105, 110, 115, 120, 125, 130, 135, 140, 145,
+    150, 155, 160, 165, 170, 175, 180, 185, 190, 195,
+    200, 205, 210, 215, 220, 225, 230, 235, 240, 245,
+    250, 255, 260, 265, 270, 275, 280, 285, 290, 295,
+    300, 305, 310, 315, 320, 325, 330, 335, 340, 345,
+    350, 355, 360, 365, 370, 375, 380, 385, 390, 395,
+    400, 405, 410, 415, 420, 425, 430, 435, 440, 445,
+];
+
+fn pawn_attacks_of(pawns: BitBoard, color: Color) -> BitBoard {
+    let bb = pawns.0;
+    let not_a = !File::A.bitboard().0;
+    let not_h = !File::H.bitboard().0;
+    match color {
+        Color::White => BitBoard(((bb & not_a) << 7) | ((bb & not_h) << 9)),
+        Color::Black => BitBoard(((bb & not_h) >> 7) | ((bb & not_a) >> 9)),
+    }
 }
 
 /// Full static evaluation from the side to move's point of view.
@@ -174,20 +250,166 @@ pub fn evaluate(t: &Tables, board: &Board) -> i32 {
     let mut mg = [0i32; 2];
     let mut eg = [0i32; 2];
     let mut phase = 0;
-    for sq in board.occupied() {
-        let p = board.piece_on(sq).unwrap();
-        let c = board.color_on(sq).unwrap();
-        let (ci, pi, si) = (c as usize, p as usize, sq as usize);
-        mg[ci] += t.mg[ci][pi][si];
-        eg[ci] += t.eg[ci][pi][si];
-        phase += PHASE_INC[pi];
+    let occ = board.occupied();
+    let pawns = board.pieces(Piece::Pawn);
+    let pawn_att = [
+        pawn_attacks_of(board.colored_pieces(Color::White, Piece::Pawn), Color::White),
+        pawn_attacks_of(board.colored_pieces(Color::Black, Piece::Pawn), Color::Black),
+    ];
+    let kings = [board.king(Color::White), board.king(Color::Black)];
+    // Attack accumulation on each king: [attack units, attacker count] indexed by defending colour.
+    let mut king_attack = [(0i32, 0i32); 2];
+
+    for color in Color::ALL {
+        let ci = color as usize;
+        let them = !color;
+        let ti = them as usize;
+        let us_bb = board.colors(color);
+        let our_pawns = us_bb & pawns;
+        let their_pawns = board.colors(them) & pawns;
+        let mobility_area = !(us_bb & (pawns | board.pieces(Piece::King))) & !pawn_att[ti];
+        let enemy_zone = t.king_zone[kings[ti] as usize];
+
+        for sq in us_bb {
+            let p = board.piece_on(sq).unwrap();
+            let (pi, si) = (p as usize, sq as usize);
+            mg[ci] += t.mg[ci][pi][si];
+            eg[ci] += t.eg[ci][pi][si];
+            phase += PHASE_INC[pi];
+            match p {
+                Piece::Pawn => {
+                    let f = sq.file() as usize;
+                    if (t.passed_mask[ci][si] & their_pawns).is_empty() {
+                        let rel_rank = sq.rank().relative_to(color) as usize;
+                        mg[ci] += PASSED_MG[rel_rank];
+                        eg[ci] += PASSED_EG[rel_rank];
+                    }
+                    if (t.adjacent_files[f] & our_pawns).is_empty() {
+                        mg[ci] += ISOLATED.0;
+                        eg[ci] += ISOLATED.1;
+                    }
+                    if (front_span_fast(sq, color) & FILE_BBS[f] & our_pawns).len() > 0 {
+                        mg[ci] += DOUBLED.0;
+                        eg[ci] += DOUBLED.1;
+                    }
+                }
+                Piece::Knight => {
+                    let att = get_knight_moves(sq);
+                    let mob = (att & mobility_area).len() as i32 - 4;
+                    mg[ci] += mob * KNIGHT_MOB.0;
+                    eg[ci] += mob * KNIGHT_MOB.1;
+                    let z = (att & enemy_zone).len() as i32;
+                    if z > 0 {
+                        king_attack[ti].0 += ATTACK_WEIGHT[pi] * z;
+                        king_attack[ti].1 += 1;
+                    }
+                }
+                Piece::Bishop => {
+                    let att = get_bishop_moves(sq, occ);
+                    let mob = (att & mobility_area).len() as i32 - 6;
+                    mg[ci] += mob * BISHOP_MOB.0;
+                    eg[ci] += mob * BISHOP_MOB.1;
+                    let z = (att & enemy_zone).len() as i32;
+                    if z > 0 {
+                        king_attack[ti].0 += ATTACK_WEIGHT[pi] * z;
+                        king_attack[ti].1 += 1;
+                    }
+                }
+                Piece::Rook => {
+                    let att = get_rook_moves(sq, occ);
+                    let mob = (att & mobility_area).len() as i32 - 7;
+                    mg[ci] += mob * ROOK_MOB.0;
+                    eg[ci] += mob * ROOK_MOB.1;
+                    let z = (att & enemy_zone).len() as i32;
+                    if z > 0 {
+                        king_attack[ti].0 += ATTACK_WEIGHT[pi] * z;
+                        king_attack[ti].1 += 1;
+                    }
+                    let file_bb = FILE_BBS[sq.file() as usize];
+                    if (file_bb & our_pawns).is_empty() {
+                        if (file_bb & their_pawns).is_empty() {
+                            mg[ci] += ROOK_OPEN.0;
+                            eg[ci] += ROOK_OPEN.1;
+                        } else {
+                            mg[ci] += ROOK_SEMI.0;
+                            eg[ci] += ROOK_SEMI.1;
+                        }
+                    }
+                    if sq.rank().relative_to(color) == Rank::Seventh
+                        && (kings[ti].rank().relative_to(color) == Rank::Eighth
+                            || !(their_pawns & Rank::Seventh.relative_to(color).bitboard()).is_empty())
+                    {
+                        mg[ci] += ROOK_SEVENTH.0;
+                        eg[ci] += ROOK_SEVENTH.1;
+                    }
+                }
+                Piece::Queen => {
+                    let att = get_bishop_moves(sq, occ) | get_rook_moves(sq, occ);
+                    let mob = (att & mobility_area).len() as i32 - 13;
+                    mg[ci] += mob * QUEEN_MOB.0;
+                    eg[ci] += mob * QUEEN_MOB.1;
+                    let z = (att & enemy_zone).len() as i32;
+                    if z > 0 {
+                        king_attack[ti].0 += ATTACK_WEIGHT[pi] * z;
+                        king_attack[ti].1 += 1;
+                    }
+                }
+                Piece::King => {}
+            }
+        }
+
+        if (us_bb & board.pieces(Piece::Bishop)).len() >= 2 {
+            mg[ci] += BISHOP_PAIR.0;
+            eg[ci] += BISHOP_PAIR.1;
+        }
+
+        // Pawn shield and open files around our king (middlegame only).
+        let ksq = kings[ci];
+        let kf = ksq.file() as usize;
+        let files = FILE_BBS[kf] | t.adjacent_files[kf];
+        let shield_ranks = match color {
+            Color::White => Rank::Second.bitboard() | Rank::Third.bitboard(),
+            Color::Black => Rank::Seventh.bitboard() | Rank::Sixth.bitboard(),
+        };
+        if ksq.rank().relative_to(color) as usize <= 1 {
+            mg[ci] += (files & shield_ranks & our_pawns).len() as i32 * SHIELD_PAWN;
+        }
+        for f in kf.saturating_sub(1)..=(kf + 1).min(7) {
+            if (FILE_BBS[f] & our_pawns).is_empty() {
+                mg[ci] += OPEN_FILE_NEAR_KING;
+            }
+        }
     }
+
+    // Apply king attack penalties to the defender.
+    for ci in 0..2 {
+        let (units, count) = king_attack[ci];
+        if count >= 2 {
+            mg[ci] -= SAFETY_TABLE[(units as usize).min(99)];
+        }
+    }
+
     let stm = board.side_to_move() as usize;
     let mg_score = mg[stm] - mg[stm ^ 1];
     let eg_score = eg[stm] - eg[stm ^ 1];
     let mg_phase = phase.min(24);
     let eg_phase = 24 - mg_phase;
     (mg_score * mg_phase + eg_score * eg_phase) / 24 + TEMPO
+}
+
+#[inline]
+fn front_span_fast(sq: Square, color: Color) -> BitBoard {
+    let r = sq.rank() as u32;
+    match color {
+        Color::White => {
+            if r >= 7 {
+                BitBoard::EMPTY
+            } else {
+                BitBoard(!0u64 << (8 * (r + 1)))
+            }
+        }
+        Color::Black => BitBoard((1u64 << (8 * r)) - 1),
+    }
 }
 
 pub fn piece_value(p: Piece) -> i32 {
@@ -199,14 +421,4 @@ pub fn piece_value(p: Piece) -> i32 {
         Piece::Queen => 950,
         Piece::King => 20000,
     }
-}
-
-#[allow(dead_code)]
-pub fn square_index(sq: Square) -> usize {
-    sq as usize
-}
-
-#[allow(dead_code)]
-pub fn color_index(c: Color) -> usize {
-    c as usize
 }

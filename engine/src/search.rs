@@ -234,6 +234,10 @@ impl Searcher {
         }
     }
 
+    pub fn static_eval(&self, board: &Board) -> i32 {
+        eval::evaluate(&self.tables, board)
+    }
+
     pub fn nodes_searched(&self) -> u64 {
         self.nodes
     }
