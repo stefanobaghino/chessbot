@@ -1,0 +1,18 @@
+[package]
+name = "chessbot-engine"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "chessbot-engine"
+path = "src/main.rs"
+
+[dependencies]
+cozy-chess = "0.3"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+debug = false
