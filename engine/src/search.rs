@@ -1,6 +1,7 @@
 //! Alpha-beta search: iterative deepening, PVS, TT, null move, LMR, quiescence with SEE.
 
 use crate::eval::{self, Tables};
+use crate::nnue::{Accumulator, Network};
 use crate::tt::{Bound, TranspositionTable};
 use cozy_chess::{
     get_bishop_moves, get_king_moves, get_knight_moves, get_pawn_attacks, get_rook_moves, BitBoard, Board, Color,
@@ -61,6 +62,9 @@ impl MoveList {
 pub struct Searcher {
     pub tt: TranspositionTable,
     pub tables: Tables,
+    pub net: Option<Box<Network>>,
+    pub use_nnue: bool,
+    accs: Vec<Accumulator>,
     stop: Arc<AtomicBool>,
     killers: [[Option<Move>; 2]; MAX_PLY],
     history: [[[i32; 64]; 64]; 2],
@@ -215,9 +219,14 @@ impl Searcher {
                 lmr[d][m] = (0.75 + (d as f64).ln() * (m as f64).ln() / 2.25) as i32;
             }
         }
+        let net = Network::load_default();
+        let use_nnue = net.is_some();
         Searcher {
             tt: TranspositionTable::new(hash_mb),
             tables: eval::build_tables(),
+            net,
+            use_nnue,
+            accs: vec![Accumulator::default(); MAX_PLY + 2],
             stop,
             killers: [[None; 2]; MAX_PLY],
             history: [[[0; 64]; 64]; 2],
@@ -235,7 +244,28 @@ impl Searcher {
     }
 
     pub fn static_eval(&self, board: &Board) -> i32 {
-        eval::evaluate(&self.tables, board)
+        match (&self.net, self.use_nnue) {
+            (Some(net), true) => net.evaluate(&net.refresh(board), board.side_to_move()),
+            _ => eval::evaluate(&self.tables, board),
+        }
+    }
+
+    #[inline]
+    fn eval_at(&self, board: &Board, ply: usize) -> i32 {
+        match (&self.net, self.use_nnue) {
+            (Some(net), true) => net.evaluate(&self.accs[ply], board.side_to_move()),
+            _ => eval::evaluate(&self.tables, board),
+        }
+    }
+
+    #[inline]
+    fn push_acc(&mut self, board: &Board, mv: Move, ply: usize) {
+        if self.use_nnue {
+            if let Some(net) = &self.net {
+                let next = net.update(&self.accs[ply], board, mv);
+                self.accs[ply + 1] = next;
+            }
+        }
     }
 
     pub fn nodes_searched(&self) -> u64 {
@@ -326,6 +356,11 @@ impl Searcher {
         self.hashes.extend_from_slice(history);
         self.root_index = self.hashes.len();
         self.hashes.push(board.hash());
+        if self.use_nnue {
+            if let Some(net) = &self.net {
+                self.accs[0] = net.refresh(board);
+            }
+        }
         for k in self.killers.iter_mut() {
             *k = [None; 2];
         }
@@ -498,7 +533,7 @@ impl Searcher {
             return 0;
         }
         if ply >= MAX_PLY - 1 {
-            return eval::evaluate(&self.tables, board);
+            return self.eval_at(board, ply);
         }
         let root = ply == 0;
         if !root {
@@ -535,7 +570,7 @@ impl Searcher {
         let static_eval = if in_check {
             -INF
         } else {
-            tt_eval.unwrap_or_else(|| eval::evaluate(&self.tables, board))
+            tt_eval.unwrap_or_else(|| self.eval_at(board, ply))
         };
 
         let stm = board.side_to_move();
@@ -552,6 +587,7 @@ impl Searcher {
                 if let Some(nb) = board.null_move() {
                     let r = 3 + depth / 4 + ((static_eval - beta) / 200).min(3);
                     self.hashes.push(nb.hash());
+                    self.accs[ply + 1] = self.accs[ply];
                     let score = -self.negamax(&nb, depth - 1 - r, ply + 1, -beta, -beta + 1, false, false);
                     self.hashes.pop();
                     if self.aborted {
@@ -611,6 +647,7 @@ impl Searcher {
             let mut child = board.clone();
             child.play_unchecked(mv);
             self.hashes.push(child.hash());
+            self.push_acc(board, mv, ply);
             let gives_check = !child.checkers().is_empty();
 
             let mut score;
@@ -698,7 +735,7 @@ impl Searcher {
             self.seldepth = ply;
         }
         if ply >= MAX_PLY - 1 {
-            return eval::evaluate(&self.tables, board);
+            return self.eval_at(board, ply);
         }
         let in_check = !board.checkers().is_empty();
         let hash = board.hash();
@@ -722,7 +759,7 @@ impl Searcher {
             best_score = -INF;
             static_eval = 0;
         } else {
-            static_eval = tt_eval.unwrap_or_else(|| eval::evaluate(&self.tables, board));
+            static_eval = tt_eval.unwrap_or_else(|| self.eval_at(board, ply));
             best_score = static_eval;
             if best_score >= beta {
                 return best_score;
@@ -756,6 +793,7 @@ impl Searcher {
             }
             let mut child = board.clone();
             child.play_unchecked(mv);
+            self.push_acc(board, mv, ply);
             let score = -self.qsearch(&child, ply + 1, -beta, -alpha);
             if self.aborted {
                 return 0;

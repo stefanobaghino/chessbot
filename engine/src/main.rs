@@ -1,4 +1,5 @@
 mod eval;
+mod nnue;
 mod search;
 mod tt;
 
@@ -20,6 +21,7 @@ enum Cmd {
     Position(Board, Vec<u64>),
     Go(Limits),
     SetHash(usize),
+    UseNnue(bool),
     Bench(i32),
     Eval,
     Quit,
@@ -97,6 +99,7 @@ fn search_thread(rx: mpsc::Receiver<Cmd>, stop: Arc<AtomicBool>) {
                 history = h;
             }
             Cmd::SetHash(mb) => searcher.tt.resize(mb),
+            Cmd::UseNnue(v) => searcher.use_nnue = v && searcher.net.is_some(),
             Cmd::Go(limits) => {
                 let best = searcher.go(&board, &history, &limits);
                 match best {
@@ -149,6 +152,12 @@ fn main() {
     };
 
     let args: Vec<String> = std::env::args().collect();
+    if args.get(1).map(String::as_str) == Some("selfcheck") {
+        nnue::selfcheck();
+        tx.send(Cmd::Quit).ok();
+        worker.join().ok();
+        return;
+    }
     if args.get(1).map(String::as_str) == Some("bench") {
         let depth = args.get(2).and_then(|d| d.parse().ok()).unwrap_or(10);
         tx.send(Cmd::Bench(depth)).ok();
@@ -168,6 +177,7 @@ fn main() {
                 println!("id author {}", AUTHOR);
                 println!("option name Hash type spin default {} min 1 max 4096", DEFAULT_HASH_MB);
                 println!("option name Threads type spin default 1 min 1 max 1");
+                println!("option name UseNNUE type check default true");
                 println!("uciok");
             }
             "isready" => println!("readyok"),
@@ -181,6 +191,9 @@ fn main() {
                 if let (Some(n), Some(v)) = (name_idx, value_idx) {
                     let name = tokens[n + 1..v].join(" ");
                     let value = tokens[v + 1..].join(" ");
+                    if name.eq_ignore_ascii_case("UseNNUE") {
+                        tx.send(Cmd::UseNnue(value.eq_ignore_ascii_case("true"))).ok();
+                    }
                     if name.eq_ignore_ascii_case("Hash") {
                         if let Ok(mb) = value.parse::<usize>() {
                             tx.send(Cmd::SetHash(mb.clamp(1, 4096))).ok();

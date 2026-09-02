@@ -5,3 +5,5 @@ __pycache__/
 target/
 matches/
 config.json
+data/
+engine/nets/random-test.bin
