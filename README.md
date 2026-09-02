@@ -38,3 +38,8 @@ lost game, `scripts/evalsym.py` checks that the static evaluation is colour-symm
 3. Upgrade the account once: `.venv/bin/python scripts/upgrade_to_bot.py`.
 4. Run `./run_bot.sh`. The bot accepts standard-chess challenges at bullet, blitz,
    rapid and classical time controls.
+
+## Results
+
+Engine at commit `63124ea` vs Stockfish 15.1 at `UCI_Elo` 2000, 100 games, 10+0.1,
+UHO book, Raspberry Pi 5: 60 wins, 18 losses, 22 draws (71%), Elo +156 ± 65.
