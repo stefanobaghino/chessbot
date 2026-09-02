@@ -32,4 +32,5 @@ for name, use in (("nnue", True), ("hce", False)):
     r = np.corrcoef(e, ref)[0, 1]
     mae = np.abs(e - ref).mean()
     sign = ((np.sign(e) == np.sign(ref)) | (np.abs(ref) < 30)).mean()
-    print(f"{name}: corr {r:.3f} mae {mae:.0f} sign-agree {sign:.2f} (n={len(e)})")
+    slope = np.polyfit(ref, e, 1)[0]
+    print(f"{name}: corr {r:.3f} mae {mae:.0f} sign-agree {sign:.2f} slope-vs-sf {slope:.2f} (n={len(e)})")
