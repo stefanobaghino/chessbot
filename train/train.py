@@ -84,7 +84,7 @@ def export(net: Net, path: str):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("data")
+    ap.add_argument("data", help="comma-separated list of .npz files")
     ap.add_argument("out")
     ap.add_argument("--hidden", type=int, default=256)
     ap.add_argument("--epochs", type=int, default=20)
@@ -97,8 +97,11 @@ def main():
     torch.set_num_threads(args.threads)
     torch.manual_seed(0)
 
-    d = np.load(args.data)
-    pieces, stm, score = d["pieces"], d["stm"], d["score"].astype(np.float32)
+    parts = [np.load(f) for f in args.data.split(",")]
+    pieces = np.concatenate([d["pieces"] for d in parts])
+    stm = np.concatenate([d["stm"] for d in parts])
+    score = np.concatenate([d["score"] for d in parts]).astype(np.float32)
+    del parts
     if args.limit:
         pieces, stm, score = pieces[: args.limit], stm[: args.limit], score[: args.limit]
     n = len(score)

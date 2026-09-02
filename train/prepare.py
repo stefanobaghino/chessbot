@@ -7,6 +7,7 @@ import json
 import sys
 from multiprocessing import Pool
 
+import chess
 import numpy as np
 
 PIECE_CODE = {c: i + 1 for i, c in enumerate("PNBRQK")}
@@ -30,6 +31,18 @@ def parse_line(line: str):
         cp = CLAMP if mate > 0 else -CLAMP
     if stm == "b":
         cp = -cp
+    # Skip positions whose label depends on an immediate tactic the static
+    # evaluation cannot see: in check, or best move is a capture/promotion.
+    try:
+        board = chess.Board(" ".join(fen[:4]) + " 0 1")
+        if board.is_check():
+            return None
+        first = pv["line"].split()[0]
+        mv = chess.Move.from_uci(first)
+        if board.is_capture(mv) or mv.promotion is not None:
+            return None
+    except (ValueError, IndexError):
+        return None
     pieces = np.zeros(64, dtype=np.uint8)
     rank = 7
     file = 0
