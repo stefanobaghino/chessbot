@@ -9,6 +9,7 @@ path = "src/main.rs"
 
 [dependencies]
 cozy-chess = "0.3"
+libc = "0.2"
 sha2 = "0.10"
 
 [profile.release]

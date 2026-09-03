@@ -195,6 +195,11 @@ fn search_thread(rx: mpsc::Receiver<Cmd>, stop: Arc<AtomicBool>) {
 }
 
 fn main() {
+    // Rust ignores SIGPIPE, turning a closed stdout into a panic on the next println!.
+    // A UCI engine whose reader went away should simply exit, like any CLI tool.
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
     let stop = Arc::new(AtomicBool::new(false));
     let (tx, rx) = mpsc::channel::<Cmd>();
     let worker = {

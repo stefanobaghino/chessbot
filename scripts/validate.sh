@@ -13,7 +13,8 @@ cargo test --release 2>&1 | grep -E "^test result" | grep -q " 0 failed" || { ca
 BIN="$SRC/engine/target/release/chessbot-engine"
 out=$("$BIN" bench 10); echo "$out" | grep -q "^bench: [1-9]" || { echo "bench failed: $out"; exit 1; }
 "$BIN" selfcheck | tee /dev/stderr | grep -qE "selfcheck: .* 0 mismatches|no network loaded"
-printf 'uci\nquit\n' | "$BIN" | grep -q "^id name chessbot-engine $VERSION "
+banner=$(printf 'uci\nquit\n' | "$BIN")
+echo "$banner" | grep -q "^id name chessbot-engine $VERSION " || { echo "bad banner: $banner"; exit 1; }
 cd "$SRC"
 "$ROOT/.venv/bin/ruff" check bot tests scripts train
 PYTHONPATH="$SRC" "$ROOT/.venv/bin/pytest" -q -p no:cacheprovider 2>&1 | tail -1

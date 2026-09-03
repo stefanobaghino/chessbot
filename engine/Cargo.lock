@@ -22,6 +22,7 @@ name = "chessbot-engine"
 version = "0.1.0"
 dependencies = [
  "cozy-chess",
+ "libc",
  "sha2",
 ]
 
