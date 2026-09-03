@@ -457,3 +457,19 @@ def test_challenge_log_uses_username(caplog):
     with caplog.at_level("INFO", logger="chessbot"):
         b.challenge_once()
     assert "idle: challenged Pi0w (1976" in caplog.text
+
+
+def test_engine_threads_option_is_configured(monkeypatch):
+    import chess.engine
+
+    configured = {}
+
+    class FakeEngine:
+        def configure(self, opts):
+            configured.update(opts)
+
+    monkeypatch.setattr(chess.engine.SimpleEngine, "popen_uci", staticmethod(lambda path, setpgrp=False: FakeEngine()))
+    g = make_game()
+    g.cfg = type("Cfg", (), {"engine_path": "x", "engine_hash": 64, "engine_threads": 3})()
+    g.new_engine()
+    assert configured == {"Hash": 64, "Threads": 3}

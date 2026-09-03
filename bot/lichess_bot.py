@@ -5,6 +5,7 @@ DOTENV_PATH (default: <repo>/.env) without overriding variables already set:
   LICHESS_TOKEN  personal API token with bot:play, challenge:read, challenge:write
   ENGINE_PATH    path to the UCI engine binary (default: engine/target/release/chessbot-engine)
   ENGINE_HASH    hash size in MB (default 128)
+  ENGINE_THREADS search threads passed as the Threads UCI option (default 1)
   MAX_GAMES      concurrent games to accept (default 1)
   SHUTDOWN_TIMEOUT  seconds to wait for games to finish after SIGTERM/SIGINT before
                  resigning them and exiting (default 900)
@@ -70,6 +71,7 @@ class Config:
             sys.exit("LICHESS_TOKEN is not set (put it in .env)")
         self.engine_path = os.environ.get("ENGINE_PATH", str(ROOT / "engine/target/release/chessbot-engine"))
         self.engine_hash = int(os.environ.get("ENGINE_HASH", "128"))
+        self.engine_threads = int(os.environ.get("ENGINE_THREADS", "1"))
         self.max_games = int(os.environ.get("MAX_GAMES", "1"))
         self.shutdown_timeout = float(os.environ.get("SHUTDOWN_TIMEOUT", "900"))
         self.stream_read_timeout = float(os.environ.get("STREAM_READ_TIMEOUT", "90"))
@@ -149,7 +151,7 @@ class Game(threading.Thread):
         # Own process group: a signal sent to the bot's group (or cgroup by a service
         # manager configured that way) must not kill the engine mid-search.
         engine = chess.engine.SimpleEngine.popen_uci(self.cfg.engine_path, setpgrp=True)
-        engine.configure({"Hash": self.cfg.engine_hash})
+        engine.configure({"Hash": self.cfg.engine_hash, "Threads": self.cfg.engine_threads})
         return engine
 
     @staticmethod
