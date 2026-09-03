@@ -222,7 +222,7 @@ fn main() {
         let Some(&cmd) = tokens.first() else { continue };
         match cmd {
             "uci" => {
-                println!("id name {}", NAME);
+                println!("id name {} v{} net:{}", NAME, env!("CARGO_PKG_VERSION"), nnue::net_id());
                 println!("id author {}", AUTHOR);
                 println!("option name Hash type spin default {} min 1 max 4096", DEFAULT_HASH_MB);
                 println!("option name Threads type spin default 1 min 1 max 8");

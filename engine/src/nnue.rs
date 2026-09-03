@@ -11,6 +11,14 @@ const FEATURES: usize = 768;
 
 static NET_BYTES: &[u8] = include_bytes!("../nets/default.bin");
 
+/// Short SHA-256 of the embedded net file, for the UCI banner.
+pub fn net_id() -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(NET_BYTES);
+    let hex: String = digest.iter().map(|b| format!("{:02x}", b)).collect();
+    hex[..12].to_string()
+}
+
 pub struct Network {
     w0: Vec<[i16; HIDDEN]>,
     b0: [i16; HIDDEN],

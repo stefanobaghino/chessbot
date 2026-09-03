@@ -1,6 +1,7 @@
 """Lichess BOT client: accepts challenges and plays them with a UCI engine.
 
-Configuration comes from environment variables (a .env file is loaded if present):
+Configuration comes from environment variables. A .env file is loaded from
+DOTENV_PATH (default: <repo>/.env) without overriding variables already set:
   LICHESS_TOKEN  personal API token with bot:play, challenge:read, challenge:write
   ENGINE_PATH    path to the UCI engine binary (default: engine/target/release/chessbot-engine)
   ENGINE_HASH    hash size in MB (default 128)
@@ -36,7 +37,7 @@ ACCEPTED_SPEEDS = {"bullet", "blitz", "rapid", "classical"}
 
 class Config:
     def __init__(self) -> None:
-        load_dotenv(ROOT / ".env")
+        load_dotenv(os.environ.get("DOTENV_PATH", ROOT / ".env"))
         self.token = os.environ.get("LICHESS_TOKEN")
         if not self.token:
             sys.exit("LICHESS_TOKEN is not set (put it in .env)")
