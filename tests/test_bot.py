@@ -436,3 +436,24 @@ def test_event_stream_counts_keepalives_and_yields_events():
     assert b.healthy()
     b.last_line_at = time.monotonic() - 1000
     assert not b.healthy()
+
+
+def test_bot_name_prefers_username():
+    from bot.lichess_bot import bot_name
+
+    assert bot_name({"id": "pi0w", "username": "Pi0w"}) == "Pi0w"
+    assert bot_name({"id": "pi0w", "name": "Pi0w"}) == "Pi0w"
+    assert bot_name({"id": "pi0w"}) == "pi0w"
+    assert bot_name({}) == "?"
+
+
+def test_challenge_log_uses_username(caplog):
+    b = idle_bot()
+    entry = {"id": "pi0w", "username": "Pi0w", "perfs": {"blitz": {"rating": 1976, "games": 500}}}
+    b.client.bots.get_online_bots = lambda limit=None: iter([entry])
+    b.client.challenges = type("Ch", (), {})()
+    b.client.challenges.create = lambda *a, **k: {"id": "c1"}
+    b.client.challenges.cancel = lambda cid: None
+    with caplog.at_level("INFO", logger="chessbot"):
+        b.challenge_once()
+    assert "idle: challenged Pi0w (1976" in caplog.text

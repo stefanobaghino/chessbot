@@ -114,6 +114,11 @@ def sd_notify(state: str) -> None:
         log.debug("sd_notify failed: %s", e)
 
 
+def bot_name(entry: dict) -> str:
+    """Display name of a /api/bot/online entry (it carries username, not name)."""
+    return entry.get("username") or entry.get("name") or entry.get("id") or "?"
+
+
 def watchdog_period() -> float | None:
     usec = os.environ.get("WATCHDOG_USEC")
     if not usec:
@@ -537,13 +542,13 @@ class Bot:
         try:
             ch = self.client.challenges.create(opp["id"], rated=self.cfg.idle_rated, clock_limit=limit, clock_increment=inc)
         except Exception as e:  # noqa: BLE001
-            log.warning("idle: challenge to %s failed (%s)", opp.get("name"), e)
+            log.warning("idle: challenge to %s failed (%s)", bot_name(opp), e)
             self.skip_until[opp["id"]] = time.monotonic() + 3600
             return False
         cid = ch.get("id") or ch.get("challenge", {}).get("id")
         with self.lock:
             self.pending_challenge = cid
-        log.info("idle: challenged %s (%s, %s+%s, %s) id=%s", opp.get("name"), opp.get("perfs", {}).get("blitz", {}).get("rating"),
+        log.info("idle: challenged %s (%s, %s+%s, %s) id=%s", bot_name(opp), opp.get("perfs", {}).get("blitz", {}).get("rating"),
                  limit, inc, "rated" if self.cfg.idle_rated else "casual", cid)
         deadline = time.monotonic() + self.cfg.idle_accept_timeout
         while time.monotonic() < deadline:
@@ -561,7 +566,7 @@ class Bot:
             self.client.challenges.cancel(cid)
         except Exception as e:  # noqa: BLE001
             log.debug("idle: cancel %s failed (%s)", cid, e)
-        log.info("idle: %s did not accept within %.0fs, cancelled", opp.get("name"), self.cfg.idle_accept_timeout)
+        log.info("idle: %s did not accept within %.0fs, cancelled", bot_name(opp), self.cfg.idle_accept_timeout)
         self.skip_until[opp["id"]] = time.monotonic() + 3600
         return False
 
