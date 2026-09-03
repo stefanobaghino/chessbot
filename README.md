@@ -84,8 +84,8 @@ Handcrafted evaluation (commit `63124ea`) vs Stockfish 15.1 at `UCI_Elo` 2000, 1
 
 NNUE `net4a` (768→256x2→1, trained on 2.1M Lichess positions relabelled by Stockfish at
 depth 6 plus 1.4M self-play positions) vs the handcrafted evaluation, 100 games at 40k
-nodes per move: 61%, Elo +78 ± 51. Vs Stockfish at `UCI_Elo` 2500, 40 games, 10+0.1,
-one thread: 15 wins, 11 losses, 14 draws (55%).
+nodes per move: 61%, Elo +78 ± 51. Vs Stockfish at `UCI_Elo` 2500, 100 games, 10+0.1, UHO book, 3 threads
+vs 1 (commit `49c349a`): 32 wins, 28 losses, 40 draws (52%), Elo +14 ± 53.
 
 ## Training a net
 
