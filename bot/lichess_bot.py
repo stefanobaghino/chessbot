@@ -22,6 +22,11 @@ DOTENV_PATH (default: <repo>/.env) without overriding variables already set:
   IDLE_RATING_RANGE  max rating distance of an opponent (default 500)
   IDLE_MIN_GAMES  minimum blitz games an opponent must have (default 50)
   IDLE_ACCEPT_TIMEOUT  seconds to wait for an opponent before cancelling (default 20)
+  IDLE_PAUSE_FILE  while this file exists, no idle challenges are made (default:
+                 unset); SIGUSR1 toggles idle challenging at runtime as well
+
+The 24 h game counter is seeded from the Lichess games API at start-up (games against
+BOT accounts) and refreshed hourly, so it survives restarts and counts external games.
 
 Liveness: when started by systemd with Type=notify and WatchdogSec, the bot sends
 READY=1 after login and WATCHDOG=1 every WatchdogSec/3 seconds while the event stream
@@ -77,6 +82,7 @@ class Config:
         self.idle_rating_range = int(os.environ.get("IDLE_RATING_RANGE", "500"))
         self.idle_min_games = int(os.environ.get("IDLE_MIN_GAMES", "50"))
         self.idle_accept_timeout = float(os.environ.get("IDLE_ACCEPT_TIMEOUT", "20"))
+        self.idle_pause_file = os.environ.get("IDLE_PAUSE_FILE") or None
 
 
 class TimeoutSession(berserk.TokenSession):
@@ -254,6 +260,8 @@ class Bot:
         self.stream_ok = False
         self.finished_at: list[float] = []
         self.pending_challenge: str | None = None
+        self.idle_paused = False
+        self.idle_pause_logged: str | None = None
         self.skip_until: dict[str, float] = {}
         self.my_rating = account.get("perfs", {}).get("blitz", {}).get("rating", 1500)
         self.signals_received = 0
@@ -271,6 +279,41 @@ class Bot:
     def install_signal_handlers(self) -> None:
         for sig in (signal.SIGTERM, signal.SIGINT):
             signal.signal(sig, self.on_signal)
+        signal.signal(signal.SIGUSR1, self.on_toggle_idle)
+
+    def on_toggle_idle(self, _signum, _frame) -> None:
+        self.idle_paused = not self.idle_paused
+        log.info("idle: %s by SIGUSR1", "paused" if self.idle_paused else "resumed")
+
+    def seed_game_counter(self) -> int:
+        """Rebuilds the 24 h counter from finished games against BOT accounts on Lichess."""
+        now_wall = time.time()
+        now_mono = time.monotonic()
+        since_ms = int((now_wall - 86400) * 1000)
+        stamps = []
+        for g in self.client.games.export_by_player(self.my_id, since=since_ms, max=200, moves=False, finished=True):
+            players = g.get("players", {})
+            opp = players.get("black" if players.get("white", {}).get("user", {}).get("id") == self.my_id else "white", {})
+            if opp.get("user", {}).get("title") != "BOT":
+                continue
+            ended = g.get("lastMoveAt") or g.get("createdAt")
+            if hasattr(ended, "timestamp"):
+                ended = ended.timestamp()
+            elif isinstance(ended, (int, float)):
+                ended = ended / 1000 if ended > 1e11 else ended
+            else:
+                continue
+            stamps.append(now_mono - (now_wall - ended))
+        with self.lock:
+            self.finished_at = sorted(stamps)
+        return len(stamps)
+
+    def refresh_game_counter(self) -> None:
+        try:
+            n = self.seed_game_counter()
+            log.info("idle: %d games vs bots in the last 24h (from Lichess)", n)
+        except Exception as e:  # noqa: BLE001
+            log.warning("idle: could not refresh the game counter (%s)", e)
 
     def on_signal(self, signum, _frame) -> None:
         self.signals_received += 1
@@ -336,7 +379,11 @@ class Bot:
     def heartbeat(self) -> None:
         period = watchdog_period()
         last_log = 0.0
+        last_refresh = time.monotonic()
         while True:
+            if self.cfg.idle_challenge and time.monotonic() - last_refresh >= 3600:
+                self.refresh_game_counter()
+                last_refresh = time.monotonic()
             if self.healthy():
                 sd_notify("WATCHDOG=1")
             now = time.monotonic()
@@ -369,7 +416,20 @@ class Bot:
         # Prefer close ratings but vary the opponent.
         return random.choice(candidates[:8])[1]
 
+    def idle_pause_reason(self) -> str | None:
+        if self.idle_paused:
+            return "SIGUSR1"
+        if self.cfg.idle_pause_file and os.path.exists(self.cfg.idle_pause_file):
+            return self.cfg.idle_pause_file
+        return None
+
     def idle_ready(self) -> bool:
+        reason = self.idle_pause_reason()
+        if reason != self.idle_pause_logged:
+            log.info("idle: %s", f"paused by {reason}" if reason else "resumed")
+            self.idle_pause_logged = reason
+        if reason:
+            return False
         with self.lock:
             busy = bool(self.games) or self.pending_challenge is not None
             last = self.finished_at[-1] if self.finished_at else None
@@ -436,6 +496,7 @@ class Bot:
         if self.cfg.idle_challenge:
             log.info("idle challenges enabled: %s+%s %s, max %d/day, gap %.0fs", self.cfg.idle_clock[0], self.cfg.idle_clock[1],
                      "rated" if self.cfg.idle_rated else "casual", self.cfg.idle_max_per_day, self.cfg.idle_gap)
+            self.refresh_game_counter()
             threading.Thread(target=self.idle_loop, name="idle", daemon=True).start()
         sd_notify("READY=1")
         threading.Thread(target=self.heartbeat, name="heartbeat", daemon=True).start()

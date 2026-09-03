@@ -204,7 +204,10 @@ def idle_bot(**cfg):
     b.my_rating = 2000
     b.stream_ok = True
     defaults = {"idle_clock": (300, 3), "idle_rated": True, "idle_max_per_day": 80, "idle_gap": 720.0,
-                "idle_rating_range": 500, "idle_min_games": 50, "idle_accept_timeout": 0.5}
+                "idle_rating_range": 500, "idle_min_games": 50, "idle_accept_timeout": 0.5, "idle_pause_file": None,
+                "idle_challenge": True}
+    b.idle_paused = False
+    b.idle_pause_logged = None
     defaults.update(cfg)
     for k, v in defaults.items():
         setattr(b.cfg, k, v)
@@ -286,3 +289,41 @@ def test_declined_event_clears_pending_challenge():
     b.pending_challenge = "c1"
     b.handle({"type": "challengeDeclined", "challenge": {"id": "c1", "challenger": {"id": "me"}, "destUser": {"name": "x"}}})
     assert b.pending_challenge is None
+
+
+def test_seed_game_counter_counts_recent_bot_games():
+    import datetime as dt
+
+    b = idle_bot()
+    now = dt.datetime.now(dt.timezone.utc)
+    games = [
+        {"players": {"white": {"user": {"id": "me"}}, "black": {"user": {"id": "b1", "title": "BOT"}}},
+         "lastMoveAt": now - dt.timedelta(hours=1)},
+        {"players": {"white": {"user": {"id": "h1"}}, "black": {"user": {"id": "me"}}},
+         "lastMoveAt": now - dt.timedelta(hours=2)},
+        {"players": {"white": {"user": {"id": "b2", "title": "BOT"}}, "black": {"user": {"id": "me"}}},
+         "lastMoveAt": int((now - dt.timedelta(hours=3)).timestamp() * 1000)},
+    ]
+    b.client.games = type("G", (), {})()
+    b.client.games.export_by_player = lambda *a, **k: iter(games)
+    assert b.seed_game_counter() == 2
+    assert b.games_last_24h() == 2
+    assert b.idle_ready()
+    b.cfg.idle_gap = 7200
+    assert not b.idle_ready()
+
+
+def test_pause_file_and_sigusr1_block_idle(tmp_path):
+    b = idle_bot()
+    b.idle_paused = False
+    b.idle_pause_logged = None
+    b.cfg.idle_pause_file = str(tmp_path / "pause")
+    assert b.idle_ready()
+    (tmp_path / "pause").write_text("")
+    assert not b.idle_ready()
+    (tmp_path / "pause").unlink()
+    assert b.idle_ready()
+    b.on_toggle_idle(signal.SIGUSR1, None)
+    assert not b.idle_ready()
+    b.on_toggle_idle(signal.SIGUSR1, None)
+    assert b.idle_ready()
