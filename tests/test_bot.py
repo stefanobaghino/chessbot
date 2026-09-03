@@ -29,6 +29,9 @@ def make_bot(timeout=30.0):
     b.lock = threading.Lock()
     b.draining = threading.Event()
     b.drain_outcomes = {}
+    b.stream_ok = True
+    b.stream_failures = 0
+    b.finished_at = []
     b.signals_received = 0
     b.exits = []
     b.exit = b.exits.append
@@ -143,3 +146,49 @@ def test_game_done_records_drain_outcomes():
     b.game_done("g1", "crashed")
     b.game_done("g2")
     assert b.drain_outcomes == {"crashed": 1, "finished": 1}
+
+
+def test_healthy_tracks_stream_failures():
+    b = make_bot()
+    b.stream_ok = False
+    b.stream_failures = 0
+    b.finished_at = []
+    assert b.healthy()
+    b.stream_failures = 3
+    assert not b.healthy()
+    b.stream_ok = True
+    assert b.healthy()
+
+
+def test_games_last_24h_counts_and_prunes():
+    b = make_bot()
+    b.finished_at = [time.monotonic() - 90000, time.monotonic() - 10, time.monotonic()]
+    assert b.games_last_24h() == 2
+    b.handle({"type": "gameFinish", "game": {"id": "g1"}})
+    assert b.games_last_24h() == 3
+
+
+def test_sd_notify_without_socket_is_noop(monkeypatch):
+    from bot.lichess_bot import sd_notify, watchdog_period
+
+    monkeypatch.delenv("NOTIFY_SOCKET", raising=False)
+    sd_notify("READY=1")
+    monkeypatch.delenv("WATCHDOG_USEC", raising=False)
+    assert watchdog_period() is None
+    monkeypatch.setenv("WATCHDOG_USEC", "30000000")
+    assert watchdog_period() == 10.0
+
+
+def test_sd_notify_sends_to_unix_socket(monkeypatch, tmp_path):
+    import socket
+
+    from bot.lichess_bot import sd_notify
+
+    path = str(tmp_path / "notify.sock")
+    srv = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+    srv.bind(path)
+    srv.settimeout(2)
+    monkeypatch.setenv("NOTIFY_SOCKET", path)
+    sd_notify("WATCHDOG=1")
+    assert srv.recv(64) == b"WATCHDOG=1"
+    srv.close()

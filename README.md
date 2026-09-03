@@ -71,6 +71,12 @@ it dies mid-game, but killing it needlessly costs search time.
 4. Run `./run_bot.sh`. The bot accepts standard-chess challenges at bullet, blitz,
    rapid and classical time controls.
 
+Under systemd use `Type=notify`, `WatchdogSec=` and `KillMode=mixed`: the bot sends
+READY=1 after login and WATCHDOG=1 while the event stream is healthy, logs an `alive:`
+line every `HEARTBEAT_INTERVAL` seconds and a `result=` line when a game ends, and drains
+games gracefully on SIGTERM. All environment variables are listed at the top of
+`bot/lichess_bot.py`.
+
 ## Results
 
 Engine at commit `63124ea` vs Stockfish 15.1 at `UCI_Elo` 2000, 100 games, 10+0.1,

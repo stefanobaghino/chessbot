@@ -8,6 +8,14 @@ DOTENV_PATH (default: <repo>/.env) without overriding variables already set:
   MAX_GAMES      concurrent games to accept (default 1)
   SHUTDOWN_TIMEOUT  seconds to wait for games to finish after SIGTERM/SIGINT before
                  resigning them and exiting (default 900)
+  STREAM_READ_TIMEOUT  seconds without any byte from the Lichess event stream (it sends
+                 keep-alives every few seconds) before the stream is considered wedged
+                 and reconnected (default 90)
+  HEARTBEAT_INTERVAL  seconds between "alive:" log lines (default 300)
+
+Liveness: when started by systemd with Type=notify and WatchdogSec, the bot sends
+READY=1 after login and WATCHDOG=1 every WatchdogSec/3 seconds while the event stream
+is healthy (connected, or reconnected after fewer than 3 consecutive failures).
 
 On SIGTERM or SIGINT the bot drains: it declines new challenges, lets games in
 progress finish, then exits 0. A second signal exits immediately.
@@ -18,6 +26,7 @@ import datetime
 import logging
 import os
 import signal
+import socket
 import sys
 import threading
 import time
@@ -45,6 +54,42 @@ class Config:
         self.engine_hash = int(os.environ.get("ENGINE_HASH", "128"))
         self.max_games = int(os.environ.get("MAX_GAMES", "1"))
         self.shutdown_timeout = float(os.environ.get("SHUTDOWN_TIMEOUT", "900"))
+        self.stream_read_timeout = float(os.environ.get("STREAM_READ_TIMEOUT", "90"))
+        self.heartbeat_interval = float(os.environ.get("HEARTBEAT_INTERVAL", "300"))
+
+
+class TimeoutSession(berserk.TokenSession):
+    """Token session with default connect/read timeouts, so a wedged stream raises."""
+
+    def __init__(self, token: str, read_timeout: float) -> None:
+        super().__init__(token)
+        self.default_timeout = (10, read_timeout)
+
+    def request(self, method, url, **kwargs):
+        kwargs.setdefault("timeout", self.default_timeout)
+        return super().request(method, url, **kwargs)
+
+
+def sd_notify(state: str) -> None:
+    """Send a systemd notification if NOTIFY_SOCKET is set; silently no-op otherwise."""
+    addr = os.environ.get("NOTIFY_SOCKET")
+    if not addr:
+        return
+    if addr.startswith("@"):
+        addr = "\0" + addr[1:]
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as sock:
+            sock.connect(addr)
+            sock.sendall(state.encode())
+    except OSError as e:
+        log.debug("sd_notify failed: %s", e)
+
+
+def watchdog_period() -> float | None:
+    usec = os.environ.get("WATCHDOG_USEC")
+    if not usec:
+        return None
+    return max(1.0, int(usec) / 1_000_000 / 3)
 
 
 class Game(threading.Thread):
@@ -94,8 +139,8 @@ class Game(threading.Thread):
                 return
             board = self.board_from(first)
             my_color = chess.WHITE if first["white"].get("id") == self.my_id else chess.BLACK
-            log.info("game %s: playing %s vs %s", self.game_id, "white" if my_color else "black",
-                     (first["black"] if my_color else first["white"]).get("name", "?"))
+            opponent = (first["black"] if my_color else first["white"]).get("name", "?")
+            log.info("game %s: playing %s vs %s", self.game_id, "white" if my_color else "black", opponent)
             self.apply_state(board, first["state"])
             engine = self.maybe_move(engine, board, my_color, first["state"])
             for event in stream:
@@ -104,7 +149,9 @@ class Game(threading.Thread):
                     board = self.board_from(first)
                     self.apply_state(board, event)
                     if event.get("status") != "started":
-                        log.info("game %s: over (%s)", self.game_id, event.get("status"))
+                        winner = event.get("winner")
+                        result = "draw" if not winner else ("win" if (winner == "white") == my_color else "loss")
+                        log.info("game %s: over (%s) result=%s vs %s", self.game_id, event.get("status"), result, opponent)
                         break
                     engine = self.maybe_move(engine, board, my_color, event)
                 elif kind == "chatLine" or kind == "opponentGone":
@@ -172,7 +219,7 @@ class Game(threading.Thread):
 class Bot:
     def __init__(self, cfg: Config) -> None:
         self.cfg = cfg
-        session = berserk.TokenSession(cfg.token)
+        session = TimeoutSession(cfg.token, cfg.stream_read_timeout)
         self.client = berserk.Client(session=session)
         account = self.client.account.get()
         self.my_id = account["id"]
@@ -182,6 +229,9 @@ class Bot:
         self.lock = threading.Lock()
         self.draining = threading.Event()
         self.drain_outcomes: dict[str, int] = {}
+        self.stream_failures = 0
+        self.stream_ok = False
+        self.finished_at: list[float] = []
         self.signals_received = 0
         self.exit = os._exit  # replaced in tests
         log.info("logged in as %s", account.get("username"))
@@ -248,16 +298,51 @@ class Bot:
                 return "later"
         return None
 
+    def games_last_24h(self) -> int:
+        cutoff = time.monotonic() - 86400
+        with self.lock:
+            self.finished_at = [t for t in self.finished_at if t >= cutoff]
+            return len(self.finished_at)
+
+    def healthy(self) -> bool:
+        return self.stream_ok or self.stream_failures < 3
+
+    def heartbeat(self) -> None:
+        period = watchdog_period()
+        last_log = 0.0
+        while True:
+            if self.healthy():
+                sd_notify("WATCHDOG=1")
+            now = time.monotonic()
+            if now - last_log >= self.cfg.heartbeat_interval:
+                with self.lock:
+                    n = len(self.games)
+                log.info("alive: %d game(s), stream %s, %d games in 24h%s", n,
+                         "ok" if self.stream_ok else f"down ({self.stream_failures} failures)",
+                         self.games_last_24h(), ", draining" if self.draining.is_set() else "")
+                last_log = now
+            time.sleep(min(period or 60.0, 60.0))
+
     def run(self) -> None:
         log.info("waiting for challenges (max %d concurrent games)", self.cfg.max_games)
+        sd_notify("READY=1")
+        threading.Thread(target=self.heartbeat, name="heartbeat", daemon=True).start()
         while not self.draining.is_set():
             try:
                 for event in self.client.bots.stream_incoming_events():
+                    if not self.stream_ok:
+                        self.stream_ok = True
+                        self.stream_failures = 0
                     self.handle(event)
-            except Exception:
+                # Stream ended without error (server closed it): reconnect quietly.
+                self.stream_ok = False
+            except Exception as e:  # noqa: BLE001
+                self.stream_ok = False
                 if self.draining.is_set():
                     break
-                log.exception("event stream failed, reconnecting in 5s")
+                self.stream_failures += 1
+                log.warning("event stream failed (%s: %s), reconnecting in 5s (failure %d)",
+                            type(e).__name__, e, self.stream_failures)
                 time.sleep(5)
         # Draining: the drain thread exits the process once the games are over.
         while True:
@@ -295,7 +380,8 @@ class Bot:
                 self.games[game_id] = g
             g.start()
         elif kind == "gameFinish":
-            pass
+            with self.lock:
+                self.finished_at.append(time.monotonic())
 
 
 def main() -> None:
