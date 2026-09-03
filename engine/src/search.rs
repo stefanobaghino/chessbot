@@ -369,9 +369,12 @@ impl Searcher {
         }
     }
 
+    /// True if the current position (already pushed as the last entry of `hashes`) occurred earlier,
+    /// either in the game or on the current search path. Only positions with the same side to move
+    /// can match, so the scan steps back two plies at a time starting from the grandparent.
     fn is_repetition(&self, hash: u64, halfmove: u8) -> bool {
         let len = self.hashes.len();
-        let mut i = len as isize - 2;
+        let mut i = len as isize - 3;
         let limit = (len as isize - 1 - halfmove as isize).max(0);
         while i >= limit {
             if self.hashes[i as usize] == hash {
@@ -485,7 +488,9 @@ impl Searcher {
                     break;
                 }
             }
-            if best_score.abs() >= MATE_IN_MAX && depth >= 8 {
+            // Stop early only on a mate the search has actually verified: the mating line must fit
+            // inside the current depth and the score must have held for a full iteration.
+            if best_score.abs() >= MATE_IN_MAX && MATE - best_score.abs() <= depth && best_score == prev_score {
                 break;
             }
             depth += 1;
@@ -1033,6 +1038,39 @@ mod tests {
         let b = Board::from_fen("6k1/5ppp/8/8/8/8/5PPP/3R2K1 w - - 0 1", false).unwrap();
         let mv = s.go(&b, &[], &Limits { depth: Some(4), ..Default::default() }).unwrap();
         assert_eq!(mv.to_string(), "d1d8");
+    }
+
+    fn hashes_after(moves: &[&str]) -> (Vec<u64>, Board) {
+        let mut b = Board::default();
+        let mut hashes = vec![b.hash()];
+        for m in moves {
+            b.play(m.parse().unwrap());
+            hashes.push(b.hash());
+        }
+        (hashes, b)
+    }
+
+    #[test]
+    fn detects_repetition_of_same_side_positions() {
+        let mut s = searcher();
+        // Knights out and back: the root is the start position for the second time.
+        let (hashes, b) = hashes_after(&["g1f3", "g8f6", "f3g1", "f6g8"]);
+        s.hashes = hashes;
+        assert!(s.is_repetition(b.hash(), 4));
+        // Same line one ply shorter: the root has occurred before only with the other side to move.
+        let (hashes, b) = hashes_after(&["g1f3", "g8f6", "f3g1"]);
+        s.hashes = hashes;
+        assert!(!s.is_repetition(b.hash(), 3));
+    }
+
+    #[test]
+    fn takes_perpetual_check_when_lost() {
+        let mut s = searcher();
+        s.silent = true;
+        // White is a queen and a rook down but can check forever on e8/h5.
+        let b = Board::from_fen("6k1/6p1/5p2/8/8/7K/r3Q3/q7 w - - 0 1", false).unwrap();
+        let mv = s.go(&b, &[], &Limits { depth: Some(8), ..Default::default() }).unwrap();
+        assert_eq!(mv.to_string(), "e2e8");
     }
 
     #[test]
