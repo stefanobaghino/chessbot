@@ -1,5 +1,7 @@
 """Fast Stockfish relabeller using raw UCI pipes (no python-chess engine layer).
 
+Input lines are either eval-DB JSON objects or plain FEN strings.
+
 Usage: relabel_fast.py src.jsonl dst.npz [--workers 4] [--depth 5] [--limit N] [--skip N]
 Drops positions in check or whose best move is a capture/promotion.
 """
@@ -54,9 +56,12 @@ def label(lines):
     for line in lines:
         i = line.find('"fen":"')
         if i < 0:
-            continue
-        j = line.find('"', i + 7)
-        fen = line[i + 7 : j]
+            fen = " ".join(line.split()[:4])
+            if len(fen.split()) < 4:
+                continue
+        else:
+            j = line.find('"', i + 7)
+            fen = line[i + 7 : j]
         try:
             board = chess.Board(fen + " 0 1")
         except ValueError:
