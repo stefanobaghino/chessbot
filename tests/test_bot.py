@@ -327,3 +327,79 @@ def test_pause_file_and_sigusr1_block_idle(tmp_path):
     assert not b.idle_ready()
     b.on_toggle_idle(signal.SIGUSR1, None)
     assert b.idle_ready()
+
+
+def make_game():
+    g = Game.__new__(Game)
+    g.game_id = "g1"
+    g.my_id = "me"
+    g.client = type("Client", (), {})()
+    g.client.bots = FakeBots()
+    return g
+
+
+def test_send_move_retries_transport_errors(monkeypatch):
+    import berserk
+
+    monkeypatch.setattr(time, "sleep", lambda s: None)
+    g = make_game()
+    calls = []
+
+    def make_move(gid, uci):
+        calls.append(uci)
+        if len(calls) < 3:
+            raise berserk.exceptions.ApiError(ConnectionError("Remote end closed connection"))
+
+    g.client.bots.make_move = make_move
+    g.send_move("e2e4")
+    assert calls == ["e2e4"] * 3
+
+
+def test_send_move_treats_not_your_turn_as_accepted(monkeypatch):
+    import berserk
+
+    monkeypatch.setattr(time, "sleep", lambda s: None)
+    g = make_game()
+    resp = type("R", (), {"status_code": 400, "reason": "Bad Request", "text": '{"error":"Not your turn, or game already over"}',
+                          "json": lambda self: {"error": "Not your turn, or game already over"}})()
+    g.client.bots.make_move = lambda gid, uci: (_ for _ in ()).throw(berserk.exceptions.ResponseError(resp))
+    g.send_move("e2e4")
+
+
+def test_play_reconnects_stream_after_transport_error(monkeypatch):
+    import berserk
+
+    monkeypatch.setattr(time, "sleep", lambda s: None)
+    g = make_game()
+    g.cfg = type("Cfg", (), {"engine_path": "x", "engine_hash": 16})()
+    g.new_engine = lambda: LiveEngine()
+    g.quit_engine = lambda e: None
+    opened = []
+
+    def stream(gid):
+        opened.append(gid)
+        full = {"type": "gameFull", "white": {"id": "me"}, "black": {"id": "opp", "name": "opp"},
+                "state": {"moves": "", "status": "started", "wtime": 60000, "btime": 60000}}
+        yield full
+        if len(opened) == 1:
+            raise berserk.exceptions.ApiError(ConnectionError("dropped"))
+        yield {"type": "gameState", "moves": "e2e4 e7e5", "status": "mate", "winner": "white"}
+
+    g.client.bots.stream_game_state = stream
+    g.client.bots.make_move = lambda gid, uci: None
+    g.play()
+    assert len(opened) == 2
+
+
+def test_reattach_resumes_ongoing_game(monkeypatch):
+    monkeypatch.setattr(time, "sleep", lambda s: None)
+    b = make_bot()
+    b.cfg.engine_path = "x"
+    b.client.games = type("G", (), {})()
+    b.client.games.get_ongoing = lambda count=10: [{"gameId": "g1"}, {"gameId": "g2"}]
+    b.games["g2"] = threading.Thread()
+    started = []
+    monkeypatch.setattr(Game, "start", lambda self: started.append(self.game_id))
+    b.reattach("g1", delay=0)
+    assert started == ["g1"]
+    assert "g1" in b.games

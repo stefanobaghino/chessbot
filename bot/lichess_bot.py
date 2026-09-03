@@ -51,6 +51,7 @@ from pathlib import Path
 import berserk
 import chess
 import chess.engine
+import requests
 from dotenv import load_dotenv
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -156,35 +157,55 @@ class Game(threading.Thread):
         except Exception:
             log.exception("engine quit failed")
 
+    TRANSIENT = (berserk.exceptions.BerserkError, requests.exceptions.RequestException)
+
     def play(self) -> None:
         engine = self.new_engine()
+        failures = 0
         try:
-            stream = self.client.bots.stream_game_state(self.game_id)
-            first = next(stream)
-            if first.get("type") != "gameFull":
-                log.warning("game %s: unexpected first event %s", self.game_id, first.get("type"))
-                return
-            board = self.board_from(first)
-            my_color = chess.WHITE if first["white"].get("id") == self.my_id else chess.BLACK
-            opponent = (first["black"] if my_color else first["white"]).get("name", "?")
-            log.info("game %s: playing %s vs %s", self.game_id, "white" if my_color else "black", opponent)
-            self.apply_state(board, first["state"])
-            engine = self.maybe_move(engine, board, my_color, first["state"])
-            for event in stream:
-                kind = event.get("type")
-                if kind == "gameState":
-                    board = self.board_from(first)
-                    self.apply_state(board, event)
-                    if event.get("status") != "started":
-                        winner = event.get("winner")
-                        result = "draw" if not winner else ("win" if (winner == "white") == my_color else "loss")
-                        log.info("game %s: over (%s) result=%s vs %s", self.game_id, event.get("status"), result, opponent)
-                        break
-                    engine = self.maybe_move(engine, board, my_color, event)
-                elif kind == "chatLine" or kind == "opponentGone":
-                    continue
+            while True:
+                try:
+                    engine = self.play_stream(engine)
+                    return
+                except self.TRANSIENT as e:
+                    failures += 1
+                    if failures > 5:
+                        raise
+                    log.warning("game %s: stream error (%s: %s), reconnecting (%d/5)", self.game_id, type(e).__name__, e, failures)
+                    time.sleep(min(2 * failures, 10))
         finally:
             self.quit_engine(engine)
+
+    def play_stream(self, engine: chess.engine.SimpleEngine) -> chess.engine.SimpleEngine:
+        """Follows the game stream until the game ends. Raises on transport errors."""
+        stream = self.client.bots.stream_game_state(self.game_id)
+        first = next(stream)
+        if first.get("type") != "gameFull":
+            log.warning("game %s: unexpected first event %s", self.game_id, first.get("type"))
+            return engine
+        board = self.board_from(first)
+        my_color = chess.WHITE if first["white"].get("id") == self.my_id else chess.BLACK
+        opponent = (first["black"] if my_color else first["white"]).get("name", "?")
+        log.info("game %s: playing %s vs %s", self.game_id, "white" if my_color else "black", opponent)
+        self.apply_state(board, first["state"])
+        if first["state"].get("status", "started") != "started":
+            log.info("game %s: already over (%s)", self.game_id, first["state"].get("status"))
+            return engine
+        engine = self.maybe_move(engine, board, my_color, first["state"])
+        for event in stream:
+            kind = event.get("type")
+            if kind == "gameState":
+                board = self.board_from(first)
+                self.apply_state(board, event)
+                if event.get("status") != "started":
+                    winner = event.get("winner")
+                    result = "draw" if not winner else ("win" if (winner == "white") == my_color else "loss")
+                    log.info("game %s: over (%s) result=%s vs %s", self.game_id, event.get("status"), result, opponent)
+                    break
+                engine = self.maybe_move(engine, board, my_color, event)
+            elif kind == "chatLine" or kind == "opponentGone":
+                continue
+        return engine
 
     @staticmethod
     def board_from(game_full: dict) -> chess.Board:
@@ -221,14 +242,29 @@ class Game(threading.Thread):
                 engine = self.new_engine()
         if result is None or result.move is None:
             return engine
-        for attempt in range(3):
-            try:
-                self.client.bots.make_move(self.game_id, result.move.uci())
-                return engine
-            except berserk.exceptions.ResponseError as e:
-                log.warning("game %s: move %s rejected (%s), attempt %d", self.game_id, result.move, e, attempt)
-                time.sleep(1)
+        self.send_move(result.move.uci())
         return engine
+
+    def send_move(self, uci: str) -> None:
+        """Posts the move, retrying transport errors; a lost response whose move was
+        accepted shows up as 'Not your turn' on the retry and counts as success."""
+        last: Exception | None = None
+        for attempt in range(1, 5):
+            try:
+                self.client.bots.make_move(self.game_id, uci)
+                return
+            except berserk.exceptions.ResponseError as e:
+                text = str(e).lower()
+                if "not your turn" in text or "already" in text:
+                    log.info("game %s: move %s was already accepted", self.game_id, uci)
+                    return
+                last = e
+                log.warning("game %s: move %s rejected (%s), attempt %d", self.game_id, uci, e, attempt)
+            except self.TRANSIENT as e:
+                last = e
+                log.warning("game %s: move %s transport error (%s: %s), attempt %d", self.game_id, uci, type(e).__name__, e, attempt)
+            time.sleep(attempt)
+        raise RuntimeError(f"game {self.game_id}: giving up on move {uci}: {last}")
 
     @staticmethod
     def ms(value) -> int:
@@ -275,6 +311,30 @@ class Bot:
                 self.drain_outcomes[outcome] = self.drain_outcomes.get(outcome, 0) + 1
         if outcome != "finished":
             log.error("game %s ended by %s", game_id, outcome)
+            if not self.draining.is_set():
+                threading.Thread(target=self.reattach, args=(game_id,), name=f"reattach-{game_id}", daemon=True).start()
+
+    def reattach(self, game_id: str, delay: float = 3.0) -> None:
+        """Re-attaches to any game still in progress after a game thread crashed."""
+        time.sleep(delay)
+        try:
+            ongoing = self.client.games.get_ongoing(count=20)
+        except Exception as e:  # noqa: BLE001
+            log.warning("reattach: could not list ongoing games (%s)", e)
+            return
+        for g in ongoing:
+            gid = g.get("gameId") or g.get("id")
+            if not gid:
+                continue
+            with self.lock:
+                if gid in self.games:
+                    continue
+                game = Game(self.client, gid, self.my_id, self.cfg, self.game_done)
+                self.games[gid] = game
+            log.warning("reattach: game %s is still in progress, resuming it", gid)
+            game.start()
+        if game_id not in [g.get("gameId") or g.get("id") for g in ongoing]:
+            log.info("reattach: game %s is no longer in progress", game_id)
 
     def install_signal_handlers(self) -> None:
         for sig in (signal.SIGTERM, signal.SIGINT):
