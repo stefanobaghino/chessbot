@@ -8,6 +8,7 @@ Configuration comes from environment variables (a .env file is loaded if present
 """
 from __future__ import annotations
 
+import datetime
 import logging
 import os
 import sys
@@ -50,7 +51,7 @@ class Game(threading.Thread):
     def run(self) -> None:
         try:
             self.play()
-        except Exception:  # noqa: BLE001 - keep the bot alive whatever a game throws
+        except Exception:
             log.exception("game %s crashed", self.game_id)
         finally:
             self.on_done(self.game_id)
@@ -79,9 +80,7 @@ class Game(threading.Thread):
                         log.info("game %s: over (%s)", self.game_id, event.get("status"))
                         break
                     self.maybe_move(engine, board, my_color, event)
-                elif kind == "chatLine":
-                    continue
-                elif kind == "opponentGone":
+                elif kind == "chatLine" or kind == "opponentGone":
                     continue
         finally:
             engine.quit()
@@ -124,8 +123,11 @@ class Game(threading.Thread):
     def ms(value) -> int:
         if value is None:
             return 60_000
+        if isinstance(value, datetime.timedelta):
+            # berserk 0.14 parses clock fields as timedeltas
+            return int(value.total_seconds() * 1000)
         if hasattr(value, "timestamp"):
-            # berserk may parse clock values as datetimes since the epoch
+            # older berserk versions parsed them as datetimes since the epoch
             return int(value.timestamp() * 1000)
         return int(value)
 
@@ -152,8 +154,6 @@ class Bot:
             return "variant"
         if challenge.get("speed") not in ACCEPTED_SPEEDS:
             return "timeControl"
-        if challenge.get("challenger", {}).get("id") == self.my_id:
-            return None
         with self.lock:
             if len(self.games) >= self.cfg.max_games:
                 return "later"
@@ -165,7 +165,7 @@ class Bot:
             try:
                 for event in self.client.bots.stream_incoming_events():
                     self.handle(event)
-            except Exception:  # noqa: BLE001
+            except Exception:
                 log.exception("event stream failed, reconnecting in 5s")
                 time.sleep(5)
 
@@ -173,16 +173,22 @@ class Bot:
         kind = event.get("type")
         if kind == "challenge":
             ch = event["challenge"]
+            if ch.get("challenger", {}).get("id") == self.my_id:
+                log.info("outgoing challenge %s to %s, waiting for the opponent", ch["id"], ch.get("destUser", {}).get("name"))
+                return
             reason = self.should_accept(ch)
-            if reason is None:
-                log.info("accepting challenge %s from %s (%s)", ch["id"], ch["challenger"].get("name"), ch.get("speed"))
-                self.client.bots.accept_challenge(ch["id"])
-            else:
-                log.info("declining challenge %s (%s)", ch["id"], reason)
-                try:
-                    self.client.bots.decline_challenge(ch["id"], reason=reason)
-                except TypeError:
-                    self.client.bots.decline_challenge(ch["id"])
+            try:
+                if reason is None:
+                    log.info("accepting challenge %s from %s (%s)", ch["id"], ch["challenger"].get("name"), ch.get("speed"))
+                    self.client.bots.accept_challenge(ch["id"])
+                else:
+                    log.info("declining challenge %s (%s)", ch["id"], reason)
+                    try:
+                        self.client.bots.decline_challenge(ch["id"], reason=reason)
+                    except TypeError:
+                        self.client.bots.decline_challenge(ch["id"])
+            except berserk.exceptions.ResponseError as e:
+                log.warning("challenge %s: request failed (%s)", ch["id"], e)
         elif kind == "gameStart":
             game_id = event["game"]["id"] if "game" in event else event["id"]
             with self.lock:
