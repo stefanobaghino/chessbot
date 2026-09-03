@@ -45,6 +45,11 @@ clone with `git config core.hooksPath scripts/hooks`.
   fixing commit lands; it never becomes a release.
 - `scripts/hooks/pre-push` refuses to push commits to `main` that were not released this
   way, so `origin/main` only ever contains validated commits.
+- Development happens on branches in separate worktrees (`git worktree add ../chessbot-<topic>
+  -b <topic> main`), never directly in the `main` checkout, so agents working in parallel do
+  not disturb each other. Land a branch with a fast-forward merge from the `main` checkout
+  (`git merge --ff-only <topic>`); `scripts/hooks/post-merge` then releases each new commit.
+  In a worktree, symlink `.venv`, `data` and `matches` to the main checkout to share them.
 - Release assets: `chessbot-<tag>-linux-aarch64.tar.gz` (`bin/chessbot-engine`, `bot/`,
   `requirements.txt`, `VERSION`) and `SHA256SUMS`. Put a line starting with `MANUAL:` in a
   commit body when deploying it needs a manual step; it is hoisted to the top of the notes.
