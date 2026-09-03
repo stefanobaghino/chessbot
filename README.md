@@ -79,5 +79,18 @@ games gracefully on SIGTERM. All environment variables are listed at the top of
 
 ## Results
 
-Engine at commit `63124ea` vs Stockfish 15.1 at `UCI_Elo` 2000, 100 games, 10+0.1,
-UHO book, Raspberry Pi 5: 60 wins, 18 losses, 22 draws (71%), Elo +156 ± 65.
+Handcrafted evaluation (commit `63124ea`) vs Stockfish 15.1 at `UCI_Elo` 2000, 100 games,
+10+0.1, UHO book, Raspberry Pi 5: 60 wins, 18 losses, 22 draws (71%), Elo +156 ± 65.
+
+NNUE `net4a` (768→256x2→1, trained on 2.1M Lichess positions relabelled by Stockfish at
+depth 6 plus 1.4M self-play positions) vs the handcrafted evaluation, 100 games at 40k
+nodes per move: 61%, Elo +78 ± 51. Vs Stockfish at `UCI_Elo` 2500, 40 games, 10+0.1,
+one thread: 15 wins, 11 losses, 14 draws (55%).
+
+## Training a net
+
+`train/relabel_fast.py` labels positions (Lichess eval-DB JSONL or plain FENs) with a
+shallow Stockfish search, dropping positions in check or whose best move is a capture;
+`scripts/selfplay_pipeline.sh` generates self-play games and relabels them;
+`train/train.py` trains and exports the quantised net; `scripts/build_with_net.sh`
+embeds a net into a test binary. `engine/nets/default.bin` is the net a release ships.
