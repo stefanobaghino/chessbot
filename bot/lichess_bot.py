@@ -38,6 +38,7 @@ progress finish, then exits 0. A second signal exits immediately.
 from __future__ import annotations
 
 import datetime
+import json
 import logging
 import os
 import random
@@ -283,6 +284,7 @@ class Bot:
     def __init__(self, cfg: Config) -> None:
         self.cfg = cfg
         session = TimeoutSession(cfg.token, cfg.stream_read_timeout)
+        self.session = session
         self.client = berserk.Client(session=session)
         account = self.client.account.get()
         self.my_id = account["id"]
@@ -294,6 +296,7 @@ class Bot:
         self.drain_outcomes: dict[str, int] = {}
         self.stream_failures = 0
         self.stream_ok = False
+        self.last_line_at: float | None = None
         self.finished_at: list[float] = []
         self.pending_challenge: str | None = None
         self.idle_paused = False
@@ -433,7 +436,26 @@ class Bot:
             self.finished_at = [t for t in self.finished_at if t >= cutoff]
             return len(self.finished_at)
 
+    def event_stream(self):
+        """Yields incoming events; blank keep-alive lines refresh last_line_at without
+        producing an event, so idle and wedged streams can be told apart."""
+        with self.session.get("https://lichess.org/api/stream/event", stream=True) as resp:
+            resp.raise_for_status()
+            self.stream_ok = True
+            self.stream_failures = 0
+            self.last_line_at = time.monotonic()
+            for line in resp.iter_lines():
+                self.last_line_at = time.monotonic()
+                if line:
+                    yield json.loads(line)
+
+    def stream_age(self) -> float | None:
+        return None if self.last_line_at is None else time.monotonic() - self.last_line_at
+
     def healthy(self) -> bool:
+        age = self.stream_age()
+        if self.stream_ok and age is not None and age > 3 * self.cfg.stream_read_timeout:
+            return False
         return self.stream_ok or self.stream_failures < 3
 
     def heartbeat(self) -> None:
@@ -450,8 +472,9 @@ class Bot:
             if now - last_log >= self.cfg.heartbeat_interval:
                 with self.lock:
                     n = len(self.games)
-                log.info("alive: %d game(s), stream %s, %d games in 24h%s", n,
-                         "ok" if self.stream_ok else f"down ({self.stream_failures} failures)",
+                age = self.stream_age()
+                stream = f"ok (last line {age:.0f}s ago)" if self.stream_ok else f"down ({self.stream_failures} failures)"
+                log.info("alive: %d game(s), stream %s, %d games in 24h%s", n, stream,
                          self.games_last_24h(), ", draining" if self.draining.is_set() else "")
                 last_log = now
             time.sleep(min(period or 60.0, 60.0))
@@ -562,10 +585,7 @@ class Bot:
         threading.Thread(target=self.heartbeat, name="heartbeat", daemon=True).start()
         while not self.draining.is_set():
             try:
-                for event in self.client.bots.stream_incoming_events():
-                    if not self.stream_ok:
-                        self.stream_ok = True
-                        self.stream_failures = 0
+                for event in self.event_stream():
                     self.handle(event)
                 # Stream ended without error (server closed it): reconnect quietly.
                 self.stream_ok = False

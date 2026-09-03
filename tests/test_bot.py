@@ -31,6 +31,7 @@ def make_bot(timeout=30.0):
     b.drain_outcomes = {}
     b.stream_ok = True
     b.stream_failures = 0
+    b.last_line_at = None
     b.finished_at = []
     b.pending_challenge = None
     b.skip_until = {}
@@ -403,3 +404,35 @@ def test_reattach_resumes_ongoing_game(monkeypatch):
     b.reattach("g1", delay=0)
     assert started == ["g1"]
     assert "g1" in b.games
+
+
+def test_event_stream_counts_keepalives_and_yields_events():
+    b = make_bot()
+    b.last_line_at = None
+    b.stream_ok = False
+    b.stream_failures = 2
+
+    class Resp:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def raise_for_status(self):
+            pass
+
+        def iter_lines(self):
+            yield b""
+            yield b""
+            yield b'{"type": "gameFinish", "game": {"id": "g1"}}'
+
+    b.session = type("S", (), {"get": lambda self, url, stream=True: Resp()})()
+    b.cfg.stream_read_timeout = 90
+    events = list(b.event_stream())
+    assert [e["type"] for e in events] == ["gameFinish"]
+    assert b.stream_ok and b.stream_failures == 0
+    assert b.stream_age() is not None and b.stream_age() < 1
+    assert b.healthy()
+    b.last_line_at = time.monotonic() - 1000
+    assert not b.healthy()
