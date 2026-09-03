@@ -147,16 +147,55 @@ impl Network {
     pub fn evaluate(&self, acc: &Accumulator, stm: Color) -> i32 {
         let us = &acc.v[stm as usize];
         let them = &acc.v[!stm as usize];
-        let mut sum: i64 = 0;
-        for i in 0..HIDDEN {
-            let a = (us[i] as i32).clamp(0, QA);
-            let b = (them[i] as i32).clamp(0, QA);
-            sum += (a * a * self.w1[i] as i32) as i64;
-            sum += (b * b * self.w1[HIDDEN + i] as i32) as i64;
-        }
+        let sum = Self::dot(us, &self.w1[..HIDDEN]) + Self::dot(them, &self.w1[HIDDEN..]);
         let out = sum / QA as i64 + self.b1 as i64;
         (out * SCALE as i64 / (QA * QB) as i64) as i32
     }
+
+    /// sum_i screlu(x_i) * w_i with SCReLU = clamp(x, 0, QA)^2.
+    #[cfg(target_arch = "aarch64")]
+    #[inline]
+    fn dot(x: &[i16; HIDDEN], w: &[i16]) -> i64 {
+        use std::arch::aarch64::*;
+        unsafe {
+            let zero = vdupq_n_s16(0);
+            let qa = vdupq_n_s16(QA as i16);
+            let mut acc0 = vdupq_n_s64(0);
+            let mut acc1 = vdupq_n_s64(0);
+            let mut i = 0;
+            while i < HIDDEN {
+                let xv = vld1q_s16(x.as_ptr().add(i));
+                let wv = vld1q_s16(w.as_ptr().add(i));
+                let a = vminq_s16(vmaxq_s16(xv, zero), qa);
+                // (a * w) fits in i32; multiplying by a again stays below i32::MAX.
+                let lo = vmull_s16(vget_low_s16(a), vget_low_s16(w_low(wv)));
+                let hi = vmull_high_s16(a, wv);
+                let a_lo = vmovl_s16(vget_low_s16(a));
+                let a_hi = vmovl_high_s16(a);
+                acc0 = vpadalq_s32(acc0, vmulq_s32(lo, a_lo));
+                acc1 = vpadalq_s32(acc1, vmulq_s32(hi, a_hi));
+                i += 8;
+            }
+            vaddvq_s64(acc0) + vaddvq_s64(acc1)
+        }
+    }
+
+    #[cfg(not(target_arch = "aarch64"))]
+    #[inline]
+    fn dot(x: &[i16; HIDDEN], w: &[i16]) -> i64 {
+        let mut sum: i64 = 0;
+        for i in 0..HIDDEN {
+            let a = (x[i] as i32).clamp(0, QA);
+            sum += (a * w[i] as i32 * a) as i64;
+        }
+        sum
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn w_low(v: std::arch::aarch64::int16x8_t) -> std::arch::aarch64::int16x8_t {
+    v
 }
 
 /// Plays pseudo-random games and checks incremental accumulators against full refreshes.
