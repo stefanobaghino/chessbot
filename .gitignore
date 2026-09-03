@@ -1,10 +1,10 @@
-.venv/
+.venv
 .env
 __pycache__/
 *.pyc
 target/
-matches/
+matches
 config.json
-data/
+data
 engine/nets/random-test.bin
 ci/
