@@ -32,6 +32,9 @@ def make_bot(timeout=30.0):
     b.stream_ok = True
     b.stream_failures = 0
     b.finished_at = []
+    b.pending_challenge = None
+    b.skip_until = {}
+    b.my_rating = 2000
     b.signals_received = 0
     b.exits = []
     b.exit = b.exits.append
@@ -192,3 +195,94 @@ def test_sd_notify_sends_to_unix_socket(monkeypatch, tmp_path):
     sd_notify("WATCHDOG=1")
     assert srv.recv(64) == b"WATCHDOG=1"
     srv.close()
+
+
+def idle_bot(**cfg):
+    b = make_bot()
+    b.pending_challenge = None
+    b.skip_until = {}
+    b.my_rating = 2000
+    b.stream_ok = True
+    defaults = {"idle_clock": (300, 3), "idle_rated": True, "idle_max_per_day": 80, "idle_gap": 720.0,
+                "idle_rating_range": 500, "idle_min_games": 50, "idle_accept_timeout": 0.5}
+    defaults.update(cfg)
+    for k, v in defaults.items():
+        setattr(b.cfg, k, v)
+    return b
+
+
+def bot_entry(bid, rating, games=100, prov=False):
+    return {"id": bid, "name": bid, "perfs": {"blitz": {"rating": rating, "games": games, "prov": prov}}}
+
+
+def test_pick_opponent_filters_candidates():
+    b = idle_bot()
+    b.skip_until["skipped"] = time.monotonic() + 100
+    bots = [bot_entry("me", 2000), bot_entry("far", 2600), bot_entry("new", 2000, games=3), bot_entry("skipped", 2000),
+            bot_entry("prov", 2000, prov=True), bot_entry("good", 2100)]
+    assert b.pick_opponent(bots)["id"] == "good"
+    assert b.pick_opponent([]) is None
+
+
+def test_idle_ready_respects_pacing():
+    b = idle_bot()
+    assert b.idle_ready()
+    b.finished_at = [time.monotonic()]
+    assert not b.idle_ready()
+    b.finished_at = [time.monotonic() - 1000]
+    assert b.idle_ready()
+    b.finished_at = [time.monotonic() - 1000] * 80
+    assert not b.idle_ready()
+    b.finished_at = []
+    b.games["g"] = threading.Thread()
+    assert not b.idle_ready()
+    b.games.clear()
+    b.stream_ok = False
+    assert not b.idle_ready()
+
+
+def test_bot_challenges_declined_at_daily_cap():
+    b = idle_bot(idle_max_per_day=1)
+    b.finished_at = [time.monotonic()]
+    ch = {"id": "c", "challenger": {"id": "x", "title": "BOT"}, "variant": {"key": "standard"}, "speed": "blitz"}
+    assert b.should_accept(ch) == "later"
+    ch["challenger"]["title"] = None
+    assert b.should_accept(ch) is None
+
+
+def test_challenge_once_cancels_when_not_accepted():
+    b = idle_bot()
+    calls = []
+    b.client.bots.get_online_bots = lambda limit=None: iter([bot_entry("opp", 2050)])
+    b.client.challenges = type("Ch", (), {})()
+    b.client.challenges.create = lambda *a, **k: calls.append(("create", a, k)) or {"id": "c1"}
+    b.client.challenges.cancel = lambda cid: calls.append(("cancel", cid))
+    assert b.challenge_once() is False
+    assert calls[0][0] == "create" and calls[0][2] == {"rated": True, "clock_limit": 300, "clock_increment": 3}
+    assert ("cancel", "c1") in calls
+    assert b.pending_challenge is None
+    assert "opp" in b.skip_until
+
+
+def test_challenge_once_returns_true_when_game_starts():
+    b = idle_bot(idle_accept_timeout=5)
+    b.client.bots.get_online_bots = lambda limit=None: iter([bot_entry("opp", 2050)])
+    b.client.challenges = type("Ch", (), {})()
+    b.client.challenges.create = lambda *a, **k: {"id": "c1"}
+    b.client.challenges.cancel = lambda cid: (_ for _ in ()).throw(AssertionError("should not cancel"))
+
+    def start_game():
+        time.sleep(0.3)
+        with b.lock:
+            b.games["g1"] = threading.Thread()
+
+    threading.Thread(target=start_game).start()
+    assert b.challenge_once() is True
+    assert b.pending_challenge is None
+
+
+def test_declined_event_clears_pending_challenge():
+    b = idle_bot()
+    b.pending_challenge = "c1"
+    b.handle({"type": "challengeDeclined", "challenge": {"id": "c1", "challenger": {"id": "me"}, "destUser": {"name": "x"}}})
+    assert b.pending_challenge is None

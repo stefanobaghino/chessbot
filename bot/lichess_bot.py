@@ -12,6 +12,16 @@ DOTENV_PATH (default: <repo>/.env) without overriding variables already set:
                  keep-alives every few seconds) before the stream is considered wedged
                  and reconnected (default 90)
   HEARTBEAT_INTERVAL  seconds between "alive:" log lines (default 300)
+  IDLE_CHALLENGE  1 to challenge an online bot whenever idle (default 0)
+  IDLE_CLOCK      clock for those games as seconds+increment (default 300+3)
+  IDLE_RATED      1 for rated (default 1)
+  IDLE_MAX_PER_DAY  cap on games finished in the trailing 24 h, incoming ones included
+                 (default 80); bot challenges are declined once it is reached
+  IDLE_GAP_SECONDS  minimum pause after a game before challenging (default 720)
+  IDLE_TICK       seconds between idle checks (default 60)
+  IDLE_RATING_RANGE  max rating distance of an opponent (default 500)
+  IDLE_MIN_GAMES  minimum blitz games an opponent must have (default 50)
+  IDLE_ACCEPT_TIMEOUT  seconds to wait for an opponent before cancelling (default 20)
 
 Liveness: when started by systemd with Type=notify and WatchdogSec, the bot sends
 READY=1 after login and WATCHDOG=1 every WatchdogSec/3 seconds while the event stream
@@ -25,6 +35,7 @@ from __future__ import annotations
 import datetime
 import logging
 import os
+import random
 import signal
 import socket
 import sys
@@ -56,6 +67,16 @@ class Config:
         self.shutdown_timeout = float(os.environ.get("SHUTDOWN_TIMEOUT", "900"))
         self.stream_read_timeout = float(os.environ.get("STREAM_READ_TIMEOUT", "90"))
         self.heartbeat_interval = float(os.environ.get("HEARTBEAT_INTERVAL", "300"))
+        self.idle_challenge = os.environ.get("IDLE_CHALLENGE", "0") == "1"
+        limit, _, inc = os.environ.get("IDLE_CLOCK", "300+3").partition("+")
+        self.idle_clock = (int(limit), int(inc or 0))
+        self.idle_rated = os.environ.get("IDLE_RATED", "1") == "1"
+        self.idle_max_per_day = int(os.environ.get("IDLE_MAX_PER_DAY", "80"))
+        self.idle_gap = float(os.environ.get("IDLE_GAP_SECONDS", "720"))
+        self.idle_tick = float(os.environ.get("IDLE_TICK", "60"))
+        self.idle_rating_range = int(os.environ.get("IDLE_RATING_RANGE", "500"))
+        self.idle_min_games = int(os.environ.get("IDLE_MIN_GAMES", "50"))
+        self.idle_accept_timeout = float(os.environ.get("IDLE_ACCEPT_TIMEOUT", "20"))
 
 
 class TimeoutSession(berserk.TokenSession):
@@ -232,6 +253,9 @@ class Bot:
         self.stream_failures = 0
         self.stream_ok = False
         self.finished_at: list[float] = []
+        self.pending_challenge: str | None = None
+        self.skip_until: dict[str, float] = {}
+        self.my_rating = account.get("perfs", {}).get("blitz", {}).get("rating", 1500)
         self.signals_received = 0
         self.exit = os._exit  # replaced in tests
         log.info("logged in as %s", account.get("username"))
@@ -289,6 +313,8 @@ class Bot:
     def should_accept(self, challenge: dict) -> str | None:
         if self.draining.is_set():
             return "later"
+        if challenge.get("challenger", {}).get("title") == "BOT" and self.games_last_24h() >= self.cfg.idle_max_per_day:
+            return "later"
         if challenge.get("variant", {}).get("key") not in ACCEPTED_VARIANTS:
             return "variant"
         if challenge.get("speed") not in ACCEPTED_SPEEDS:
@@ -323,8 +349,94 @@ class Bot:
                 last_log = now
             time.sleep(min(period or 60.0, 60.0))
 
+    def pick_opponent(self, bots) -> dict | None:
+        now = time.monotonic()
+        candidates = []
+        for b in bots:
+            bid = b.get("id")
+            if not bid or bid == self.my_id or self.skip_until.get(bid, 0) > now:
+                continue
+            blitz = b.get("perfs", {}).get("blitz", {})
+            if blitz.get("games", 0) < self.cfg.idle_min_games or blitz.get("prov"):
+                continue
+            distance = abs(blitz.get("rating", 1500) - self.my_rating)
+            if distance > self.cfg.idle_rating_range:
+                continue
+            candidates.append((distance, b))
+        if not candidates:
+            return None
+        candidates.sort(key=lambda c: c[0])
+        # Prefer close ratings but vary the opponent.
+        return random.choice(candidates[:8])[1]
+
+    def idle_ready(self) -> bool:
+        with self.lock:
+            busy = bool(self.games) or self.pending_challenge is not None
+            last = self.finished_at[-1] if self.finished_at else None
+        if busy or self.draining.is_set() or not self.stream_ok:
+            return False
+        if self.games_last_24h() >= self.cfg.idle_max_per_day:
+            return False
+        return last is None or time.monotonic() - last >= self.cfg.idle_gap
+
+    def challenge_once(self) -> bool:
+        """Challenges one online bot and waits for the game to start. Returns True if it did."""
+        try:
+            bots = list(self.client.bots.get_online_bots(limit=300))
+        except Exception as e:  # noqa: BLE001
+            log.warning("idle: listing online bots failed (%s)", e)
+            return False
+        opp = self.pick_opponent(bots)
+        if opp is None:
+            log.info("idle: no suitable opponent among %d online bots", len(bots))
+            return False
+        limit, inc = self.cfg.idle_clock
+        try:
+            ch = self.client.challenges.create(opp["id"], rated=self.cfg.idle_rated, clock_limit=limit, clock_increment=inc)
+        except Exception as e:  # noqa: BLE001
+            log.warning("idle: challenge to %s failed (%s)", opp.get("name"), e)
+            self.skip_until[opp["id"]] = time.monotonic() + 3600
+            return False
+        cid = ch.get("id") or ch.get("challenge", {}).get("id")
+        with self.lock:
+            self.pending_challenge = cid
+        log.info("idle: challenged %s (%s, %s+%s, %s) id=%s", opp.get("name"), opp.get("perfs", {}).get("blitz", {}).get("rating"),
+                 limit, inc, "rated" if self.cfg.idle_rated else "casual", cid)
+        deadline = time.monotonic() + self.cfg.idle_accept_timeout
+        while time.monotonic() < deadline:
+            with self.lock:
+                if self.games or self.pending_challenge is None:
+                    started = bool(self.games)
+                    self.pending_challenge = None
+                    if not started:
+                        self.skip_until[opp["id"]] = time.monotonic() + 3600
+                    return started
+            time.sleep(0.5)
+        with self.lock:
+            self.pending_challenge = None
+        try:
+            self.client.challenges.cancel(cid)
+        except Exception as e:  # noqa: BLE001
+            log.debug("idle: cancel %s failed (%s)", cid, e)
+        log.info("idle: %s did not accept within %.0fs, cancelled", opp.get("name"), self.cfg.idle_accept_timeout)
+        self.skip_until[opp["id"]] = time.monotonic() + 3600
+        return False
+
+    def idle_loop(self) -> None:
+        while True:
+            time.sleep(self.cfg.idle_tick)
+            try:
+                if self.idle_ready():
+                    self.challenge_once()
+            except Exception:
+                log.exception("idle: challenge attempt failed")
+
     def run(self) -> None:
         log.info("waiting for challenges (max %d concurrent games)", self.cfg.max_games)
+        if self.cfg.idle_challenge:
+            log.info("idle challenges enabled: %s+%s %s, max %d/day, gap %.0fs", self.cfg.idle_clock[0], self.cfg.idle_clock[1],
+                     "rated" if self.cfg.idle_rated else "casual", self.cfg.idle_max_per_day, self.cfg.idle_gap)
+            threading.Thread(target=self.idle_loop, name="idle", daemon=True).start()
         sd_notify("READY=1")
         threading.Thread(target=self.heartbeat, name="heartbeat", daemon=True).start()
         while not self.draining.is_set():
@@ -382,6 +494,14 @@ class Bot:
         elif kind == "gameFinish":
             with self.lock:
                 self.finished_at.append(time.monotonic())
+        elif kind in ("challengeDeclined", "challengeCanceled"):
+            ch = event.get("challenge", {})
+            with self.lock:
+                if ch.get("id") == self.pending_challenge:
+                    self.pending_challenge = None
+            if ch.get("challenger", {}).get("id") == self.my_id:
+                log.info("idle: challenge %s to %s %s (%s)", ch.get("id"), ch.get("destUser", {}).get("name"),
+                         "declined" if kind == "challengeDeclined" else "cancelled", ch.get("declineReason", ""))
 
 
 def main() -> None:
