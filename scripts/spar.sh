@@ -13,7 +13,9 @@ BOOK="$HOME/tools/books/UHO_Lichess_4852_v1.epd"
 OUT="$ROOT/matches/${NAME}"
 ROUNDS=$(( (GAMES + 1) / 2 ))
 export PATH="$HOME/.local/bin:$PATH"
-nice fastchess \
+# Keep off the live bot's cores (0-1); see README "Sharing the machine with the live bot".
+SPAR_CPUS="${SPAR_CPUS:-2-3}"
+nice taskset -c "$SPAR_CPUS" fastchess \
   -engine cmd="$NEW" name=new \
   -engine cmd="$OLD" name=old \
   -each tc=inf nodes="$NODES" option.Hash=32 $EXTRA \

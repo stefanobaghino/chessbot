@@ -30,67 +30,11 @@ scripts/match.sh 2000 100 10+0.1 3 goal
 `scripts/blunders.py matches/<run>.pgn` lists the moves that lost the most in each
 lost game, `scripts/evalsym.py` checks that the static evaluation is colour-symmetric.
 
-## CI/CD and releases
+### Sharing the machine with the live bot
 
-Continuous delivery runs on this machine, not on a hosted CI. Enable the hooks once per
-clone with `git config core.hooksPath scripts/hooks`.
-
-- `scripts/hooks/post-commit` starts `scripts/ci.sh` in the background after every commit
-  on `main` (log in `ci/ci.log`, per-release logs in `ci/logs/`).
-- `scripts/ci.sh` takes each commit since the last `v*` tag, in order, exports it with
-  `git archive`, runs `scripts/validate.sh` (release build for this CPU, `cargo test`,
-  `bench`, NNUE self-check, ruff, pytest), then `scripts/package.sh`, creates a signed
-  tag with the next patch version, pushes the commit and tag, and publishes a GitHub
-  Release whose notes are the commit message. A failing commit stops the pipeline until a
-  fixing commit lands; it never becomes a release.
-- `scripts/hooks/pre-push` refuses to push commits to `main` that were not released this
-  way, so `origin/main` only ever contains validated commits.
-- Development happens on branches in separate worktrees (`git worktree add ../chessbot-<topic>
-  -b <topic> main`), never directly in the `main` checkout, so agents working in parallel do
-  not disturb each other. Land a branch with a fast-forward merge from the `main` checkout
-  (`git merge --ff-only <topic>`); `scripts/hooks/post-merge` then releases each new commit.
-  In a worktree, symlink `.venv`, `data` and `matches` to the main checkout to share them;
-  never replace those directories in the main checkout itself, they hold the only copies
-  of the virtualenv, training data and match results.
-
-A service manager must signal only the bot's main process on stop (systemd:
-`KillMode=mixed`); the engine child runs in its own process group and is re-spawned if
-it dies mid-game, but killing it needlessly costs search time.
-- Release assets: `chessbot-<tag>-linux-aarch64.tar.gz` (`bin/chessbot-engine`, `bot/`,
-  `requirements.txt`, `VERSION`) and `SHA256SUMS`. Put a line starting with `MANUAL:` in a
-  commit body when deploying it needs a manual step; it is hoisted to the top of the notes.
-- The engine reports its version and embedded net in the `uci` banner, e.g.
-  `id name chessbot-engine v0.1.0 net:d17c329e3df9`.
-
-## Play on Lichess
-
-1. Create a fresh Lichess account (it must have played no games) and generate a
-   personal API token with the `bot:play`, `challenge:read` and `challenge:write` scopes.
-2. Put it in `.env` as `LICHESS_TOKEN=lip_...` (the file is git-ignored).
-3. Upgrade the account once: `.venv/bin/python scripts/upgrade_to_bot.py`.
-4. Run `./run_bot.sh`. The bot accepts standard-chess challenges at bullet, blitz,
-   rapid and classical time controls.
-
-Under systemd use `Type=notify`, `WatchdogSec=` and `KillMode=mixed`: the bot sends
-READY=1 after login and WATCHDOG=1 while the event stream is healthy, logs an `alive:`
-line every `HEARTBEAT_INTERVAL` seconds and a `result=` line when a game ends, and drains
-games gracefully on SIGTERM. All environment variables are listed at the top of
-`bot/lichess_bot.py`.
-
-## Results
-
-Handcrafted evaluation (commit `63124ea`) vs Stockfish 15.1 at `UCI_Elo` 2000, 100 games,
-10+0.1, UHO book, Raspberry Pi 5: 60 wins, 18 losses, 22 draws (71%), Elo +156 ± 65.
-
-NNUE `net4a` (768→256x2→1, trained on 2.1M Lichess positions relabelled by Stockfish at
-depth 6 plus 1.4M self-play positions) vs the handcrafted evaluation, 100 games at 40k
-nodes per move: 61%, Elo +78 ± 51. Vs Stockfish at `UCI_Elo` 2500, 100 games, 10+0.1, UHO book, 3 threads
-vs 1 (commit `49c349a`): 32 wins, 28 losses, 40 draws (52%), Elo +14 ± 53.
-
-## Training a net
-
-`train/relabel_fast.py` labels positions (Lichess eval-DB JSONL or plain FENs) with a
-shallow Stockfish search, dropping positions in check or whose best move is a capture;
-`scripts/selfplay_pipeline.sh` generates self-play games and relabels them;
-`train/train.py` trains and exports the quantised net; `scripts/build_with_net.sh`
-embeds a net into a test binary. `engine/nets/default.bin` is the net a release ships.
+The Lichess bot runs on cores 0-1 (`CPUAffinity=0 1` in its systemd unit). `spar.sh`
+and `match.sh` pin their games to cores 2-3 with `taskset` (override with `SPAR_CPUS`);
+sparring engines alternate moves, so two concurrent games fill the two cores.
+Background jobs go into cgroups created once per boot with `sudo scripts/cgroups.sh`:
+`quiet` (one core) for relabelling and data generation, `train` (two cores) for
+training, both restricted to cores 2-3. `match.sh` freezes them while timed games run.
