@@ -5,12 +5,18 @@ Configuration comes from environment variables (a .env file is loaded if present
   ENGINE_PATH    path to the UCI engine binary (default: engine/target/release/chessbot-engine)
   ENGINE_HASH    hash size in MB (default 128)
   MAX_GAMES      concurrent games to accept (default 1)
+  SHUTDOWN_TIMEOUT  seconds to wait for games to finish after SIGTERM/SIGINT before
+                 resigning them and exiting (default 900)
+
+On SIGTERM or SIGINT the bot drains: it declines new challenges, lets games in
+progress finish, then exits 0. A second signal exits immediately.
 """
 from __future__ import annotations
 
 import datetime
 import logging
 import os
+import signal
 import sys
 import threading
 import time
@@ -37,6 +43,7 @@ class Config:
         self.engine_path = os.environ.get("ENGINE_PATH", str(ROOT / "engine/target/release/chessbot-engine"))
         self.engine_hash = int(os.environ.get("ENGINE_HASH", "128"))
         self.max_games = int(os.environ.get("MAX_GAMES", "1"))
+        self.shutdown_timeout = float(os.environ.get("SHUTDOWN_TIMEOUT", "900"))
 
 
 class Game(threading.Thread):
@@ -143,13 +150,59 @@ class Bot:
             sys.exit(f"account {self.my_id} is not a BOT account; run scripts/upgrade_to_bot.py first")
         self.games: dict[str, Game] = {}
         self.lock = threading.Lock()
+        self.draining = threading.Event()
+        self.signals_received = 0
+        self.exit = os._exit  # replaced in tests
         log.info("logged in as %s", account.get("username"))
 
     def game_done(self, game_id: str) -> None:
         with self.lock:
             self.games.pop(game_id, None)
 
+    def install_signal_handlers(self) -> None:
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            signal.signal(sig, self.on_signal)
+
+    def on_signal(self, signum, _frame) -> None:
+        self.signals_received += 1
+        name = signal.Signals(signum).name
+        if self.signals_received > 1:
+            log.warning("received %s again, exiting immediately", name)
+            self.exit(1)
+            return
+        with self.lock:
+            n = len(self.games)
+        log.info("received %s, draining: %d game(s) in progress", name, n)
+        self.draining.set()
+        threading.Thread(target=self.drain, name="drain", daemon=True).start()
+
+    def drain(self) -> None:
+        deadline = time.monotonic() + self.cfg.shutdown_timeout
+        while True:
+            with self.lock:
+                remaining = list(self.games)
+            if not remaining:
+                break
+            if time.monotonic() >= deadline:
+                log.warning("shutdown timeout reached, resigning %d game(s)", len(remaining))
+                for game_id in remaining:
+                    try:
+                        self.client.bots.resign_game(game_id)
+                    except Exception:
+                        log.exception("failed to resign game %s", game_id)
+                with self.lock:
+                    threads = list(self.games.values())
+                for t in threads:
+                    if t.is_alive():
+                        t.join(timeout=10)
+                break
+            time.sleep(1)
+        log.info("drained, exiting")
+        self.exit(0)
+
     def should_accept(self, challenge: dict) -> str | None:
+        if self.draining.is_set():
+            return "later"
         if challenge.get("variant", {}).get("key") not in ACCEPTED_VARIANTS:
             return "variant"
         if challenge.get("speed") not in ACCEPTED_SPEEDS:
@@ -161,13 +214,18 @@ class Bot:
 
     def run(self) -> None:
         log.info("waiting for challenges (max %d concurrent games)", self.cfg.max_games)
-        while True:
+        while not self.draining.is_set():
             try:
                 for event in self.client.bots.stream_incoming_events():
                     self.handle(event)
             except Exception:
+                if self.draining.is_set():
+                    break
                 log.exception("event stream failed, reconnecting in 5s")
                 time.sleep(5)
+        # Draining: the drain thread exits the process once the games are over.
+        while True:
+            time.sleep(60)
 
     def handle(self, event: dict) -> None:
         kind = event.get("type")
@@ -191,6 +249,9 @@ class Bot:
                 log.warning("challenge %s: request failed (%s)", ch["id"], e)
         elif kind == "gameStart":
             game_id = event["game"]["id"] if "game" in event else event["id"]
+            if self.draining.is_set():
+                log.info("draining, not starting game %s", game_id)
+                return
             with self.lock:
                 if game_id in self.games:
                     return
@@ -203,7 +264,9 @@ class Bot:
 
 def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-    Bot(Config()).run()
+    bot = Bot(Config())
+    bot.install_signal_handlers()
+    bot.run()
 
 
 if __name__ == "__main__":
