@@ -1,6 +1,13 @@
 """Correlate engine static evals (NNUE and HCE) with Stockfish search evals on PGN positions."""
-import subprocess, sys, random
-import numpy as np, chess, chess.pgn, chess.engine
+import random
+import subprocess
+import sys
+
+import chess
+import chess.engine
+import chess.pgn
+import numpy as np
+
 eng, pgn = sys.argv[1], sys.argv[2]
 depth = int(sys.argv[3]) if len(sys.argv) > 3 else 10
 random.seed(0)
@@ -17,7 +24,7 @@ with open(pgn) as f:
 random.shuffle(fens); fens = fens[:400]
 def evals(use_nnue):
     cmds = f"setoption name UseNNUE value {str(use_nnue).lower()}\n" + "".join(f"position fen {x}\neval\n" for x in fens) + "quit\n"
-    out = subprocess.run([eng], input=cmds, capture_output=True, text=True).stdout
+    out = subprocess.run([eng], input=cmds, capture_output=True, text=True, check=True).stdout
     return np.array([int(l.split()[1]) for l in out.splitlines() if l.startswith("eval ")], dtype=float)
 sf = chess.engine.SimpleEngine.popen_uci("stockfish")
 ref = []

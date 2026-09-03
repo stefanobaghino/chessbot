@@ -1016,3 +1016,31 @@ fn tt_score_from(score: i32, ply: usize) -> i32 {
         score
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tt::TranspositionTable;
+
+    fn searcher() -> Searcher {
+        Searcher::new(Arc::new(TranspositionTable::new(8)), Arc::new(AtomicBool::new(false)), Arc::new(AtomicU64::new(0)), 0)
+    }
+
+    #[test]
+    fn finds_mate_in_one() {
+        let mut s = searcher();
+        s.silent = true;
+        let b = Board::from_fen("6k1/5ppp/8/8/8/8/5PPP/3R2K1 w - - 0 1", false).unwrap();
+        let mv = s.go(&b, &[], &Limits { depth: Some(4), ..Default::default() }).unwrap();
+        assert_eq!(mv.to_string(), "d1d8");
+    }
+
+    #[test]
+    fn see_values_captures() {
+        let b = Board::from_fen("4k3/8/8/3p4/4P3/8/8/4K3 w - - 0 1", false).unwrap();
+        let mv = Move { from: Square::E4, to: Square::D5, promotion: None };
+        assert_eq!(see(&b, mv), 100);
+        let b = Board::from_fen("4k3/8/2p5/3p4/4P3/8/8/4K3 w - - 0 1", false).unwrap();
+        assert_eq!(see(&b, mv), 0);
+    }
+}

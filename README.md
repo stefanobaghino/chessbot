@@ -30,6 +30,27 @@ scripts/match.sh 2000 100 10+0.1 3 goal
 `scripts/blunders.py matches/<run>.pgn` lists the moves that lost the most in each
 lost game, `scripts/evalsym.py` checks that the static evaluation is colour-symmetric.
 
+## CI/CD and releases
+
+Continuous delivery runs on this machine, not on a hosted CI. Enable the hooks once per
+clone with `git config core.hooksPath scripts/hooks`.
+
+- `scripts/hooks/post-commit` starts `scripts/ci.sh` in the background after every commit
+  on `main` (log in `ci/ci.log`, per-release logs in `ci/logs/`).
+- `scripts/ci.sh` takes each commit since the last `v*` tag, in order, exports it with
+  `git archive`, runs `scripts/validate.sh` (release build for this CPU, `cargo test`,
+  `bench`, NNUE self-check, ruff, pytest), then `scripts/package.sh`, creates a signed
+  tag with the next patch version, pushes the commit and tag, and publishes a GitHub
+  Release whose notes are the commit message. A failing commit stops the pipeline until a
+  fixing commit lands; it never becomes a release.
+- `scripts/hooks/pre-push` refuses to push commits to `main` that were not released this
+  way, so `origin/main` only ever contains validated commits.
+- Release assets: `chessbot-<tag>-linux-aarch64.tar.gz` (`bin/chessbot-engine`, `bot/`,
+  `requirements.txt`, `VERSION`) and `SHA256SUMS`. Put a line starting with `MANUAL:` in a
+  commit body when deploying it needs a manual step; it is hoisted to the top of the notes.
+- The engine reports its version and embedded net in the `uci` banner, e.g.
+  `id name chessbot-engine v0.1.0 net:d17c329e3df9`.
+
 ## Play on Lichess
 
 1. Create a fresh Lichess account (it must have played no games) and generate a

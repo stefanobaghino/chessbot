@@ -186,3 +186,35 @@ impl TranspositionTable {
         used * 1000 / sample
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn move_packing_roundtrips() {
+        for from in [Square::A1, Square::E2, Square::H8] {
+            for to in [Square::A8, Square::E4, Square::H1] {
+                for promo in [None, Some(Piece::Queen), Some(Piece::Knight)] {
+                    let mv = Move { from, to, promotion: promo };
+                    assert_eq!(unpack_move(pack_move(Some(mv))), Some(mv));
+                }
+            }
+        }
+        assert_eq!(unpack_move(pack_move(None)), None);
+    }
+
+    #[test]
+    fn store_and_probe() {
+        let tt = TranspositionTable::new(1);
+        let mv = Move { from: Square::E2, to: Square::E4, promotion: None };
+        tt.store(0x1234_5678_9abc_def0, Some(mv), 42, 10, 7, Bound::Exact);
+        let e = tt.probe(0x1234_5678_9abc_def0).expect("entry");
+        assert_eq!(e.best_move(), Some(mv));
+        assert_eq!(e.score, 42);
+        assert_eq!(e.eval, 10);
+        assert_eq!(e.depth, 7);
+        assert_eq!(e.bound(), Bound::Exact);
+        assert!(tt.probe(0x1234_5678_9abc_def1).is_none());
+    }
+}

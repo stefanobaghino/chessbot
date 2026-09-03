@@ -7,3 +7,4 @@ matches/
 config.json
 data/
 engine/nets/random-test.bin
+ci/

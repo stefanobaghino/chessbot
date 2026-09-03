@@ -1,6 +1,13 @@
 """Eval correlation with Stockfish split by number of pieces on the board."""
-import subprocess, sys, random
-import numpy as np, chess, chess.pgn, chess.engine
+import random
+import subprocess
+import sys
+
+import chess
+import chess.engine
+import chess.pgn
+import numpy as np
+
 eng, pgn = sys.argv[1], sys.argv[2]
 random.seed(1)
 fens = []
@@ -16,7 +23,7 @@ with open(pgn) as f:
 random.shuffle(fens); fens = fens[:600]
 def evals(use):
     cmds = f"setoption name UseNNUE value {str(use).lower()}\n" + "".join(f"position fen {x}\neval\n" for x in fens) + "quit\n"
-    out = subprocess.run([eng], input=cmds, capture_output=True, text=True).stdout
+    out = subprocess.run([eng], input=cmds, capture_output=True, text=True, check=True).stdout
     return np.array([int(l.split()[1]) for l in out.splitlines() if l.startswith("eval ")], float)
 sf = chess.engine.SimpleEngine.popen_uci("stockfish")
 ref = np.array([sf.analyse(chess.Board(x), chess.engine.Limit(depth=8))["score"].pov(chess.Board(x).turn).score(mate_score=3000) for x in fens], float)

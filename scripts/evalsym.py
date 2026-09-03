@@ -1,9 +1,14 @@
 """Check static eval symmetry (colour flip) on positions from a PGN."""
-import subprocess, sys, chess, chess.pgn
+import subprocess
+import sys
+
+import chess
+import chess.pgn
+
 eng = sys.argv[1]; pgn = sys.argv[2]
 def ev(fen):
-    out = subprocess.run([eng], input=f"position fen {fen}\neval\nquit\n", capture_output=True, text=True).stdout
-    return int([l for l in out.splitlines() if l.startswith("eval ")][0].split()[1])
+    out = subprocess.run([eng], input=f"position fen {fen}\neval\nquit\n", capture_output=True, text=True, check=True).stdout
+    return int(next(l for l in out.splitlines() if l.startswith("eval ")).split()[1])
 bad = 0; n = 0
 with open(pgn) as f:
     while n < 300:

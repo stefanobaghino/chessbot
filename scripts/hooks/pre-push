@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+# Refuse to push commits to main that have not been released by scripts/ci.sh
+# (every released commit carries a v* tag). Tags themselves pass through.
+while read -r local_ref local_sha remote_ref remote_sha; do
+  [ "$remote_ref" = "refs/heads/main" ] || continue
+  [ "$local_sha" = "0000000000000000000000000000000000000000" ] && continue
+  if [ -z "$(git tag --points-at "$local_sha" 'v*')" ]; then
+    echo "pre-push: $local_sha is not a released commit; run scripts/ci.sh instead of pushing main directly" >&2
+    exit 1
+  fi
+done
+exit 0

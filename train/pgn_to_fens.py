@@ -1,6 +1,7 @@
 """Extract training positions from PGN games: one FEN per line, skipping the
 first plies, positions in check, and the last plies before a decisive end."""
 import sys
+
 import chess.pgn
 
 src, dst = sys.argv[1], sys.argv[2]

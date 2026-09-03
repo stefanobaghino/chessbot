@@ -422,3 +422,45 @@ pub fn piece_value(p: Piece) -> i32 {
         Piece::King => 20000,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn mirror_fen(fen: &str) -> String {
+        // Swap colours and flip ranks so the evaluation must be negated.
+        let mut parts: Vec<String> = fen.split(' ').map(String::from).collect();
+        let ranks: Vec<String> = parts[0]
+            .split('/')
+            .rev()
+            .map(|r| r.chars().map(|c| if c.is_ascii_uppercase() { c.to_ascii_lowercase() } else { c.to_ascii_uppercase() }).collect())
+            .collect();
+        parts[0] = ranks.join("/");
+        parts[1] = if parts[1] == "w" { "b".into() } else { "w".into() };
+        parts[2] = parts[2].chars().map(|c| if c.is_ascii_uppercase() { c.to_ascii_lowercase() } else { c.to_ascii_uppercase() }).collect();
+        parts.join(" ")
+    }
+
+    #[test]
+    fn evaluation_is_colour_symmetric() {
+        let t = build_tables();
+        for fen in [
+            "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
+            "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1",
+            "8/2p5/3p4/KP5r/1R3p1k/8/4P1P1/8 w - - 0 1",
+            "r4rk1/1pp1qppp/p1np1n2/2b1p1B1/2B1P1b1/P1NP1N2/1PP1QPPP/R4RK1 w - - 0 10",
+        ] {
+            let a = Board::from_fen(fen, false).unwrap();
+            let b = Board::from_fen(&mirror_fen(fen), false).unwrap();
+            assert_eq!(evaluate(&t, &a), evaluate(&t, &b), "{fen}");
+        }
+    }
+
+    #[test]
+    fn material_matters() {
+        let t = build_tables();
+        let full = Board::from_fen("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1", false).unwrap();
+        let no_knight = Board::from_fen("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKB1R w KQkq - 0 1", false).unwrap();
+        assert!(evaluate(&t, &full) > evaluate(&t, &no_knight) + 200);
+    }
+}

@@ -7,7 +7,7 @@ import time
 
 import numpy as np
 import torch
-import torch.nn as nn
+from torch import nn
 
 SCALE = 400.0
 QA = 255

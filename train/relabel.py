@@ -6,7 +6,6 @@ Output matches prepare.py: pieces uint8 [N,64], stm uint8 [N], score int16 (stm 
 """
 import argparse
 import itertools
-import sys
 from multiprocessing import Pool
 
 import chess

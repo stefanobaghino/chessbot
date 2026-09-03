@@ -17,6 +17,11 @@ use std::thread;
 const NAME: &str = "chessbot-engine";
 const AUTHOR: &str = "Stefano Baghino";
 const DEFAULT_HASH_MB: usize = 64;
+/// Release version injected by the CI build; development builds carry the crate version.
+const VERSION: &str = match option_env!("CHESSBOT_VERSION") {
+    Some(v) => v,
+    None => concat!("v", env!("CARGO_PKG_VERSION"), "-dev"),
+};
 
 enum Cmd {
     NewGame,
@@ -222,7 +227,7 @@ fn main() {
         let Some(&cmd) = tokens.first() else { continue };
         match cmd {
             "uci" => {
-                println!("id name {} v{} net:{}", NAME, env!("CARGO_PKG_VERSION"), nnue::net_id());
+                println!("id name {} {} net:{}", NAME, VERSION, nnue::net_id());
                 println!("id author {}", AUTHOR);
                 println!("option name Hash type spin default {} min 1 max 4096", DEFAULT_HASH_MB);
                 println!("option name Threads type spin default 1 min 1 max 8");

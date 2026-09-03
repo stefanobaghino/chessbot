@@ -1,5 +1,6 @@
 """Find the worst move per lost game using Stockfish at fixed depth."""
 import sys
+
 import chess
 import chess.engine
 import chess.pgn
