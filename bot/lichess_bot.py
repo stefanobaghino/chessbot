@@ -57,16 +57,35 @@ class Game(threading.Thread):
         self.on_done = on_done
 
     def run(self) -> None:
+        outcome = "finished"
         try:
             self.play()
         except Exception:
+            outcome = "crashed"
             log.exception("game %s crashed", self.game_id)
         finally:
-            self.on_done(self.game_id)
+            self.on_done(self.game_id, outcome)
+
+    def new_engine(self) -> chess.engine.SimpleEngine:
+        # Own process group: a signal sent to the bot's group (or cgroup by a service
+        # manager configured that way) must not kill the engine mid-search.
+        engine = chess.engine.SimpleEngine.popen_uci(self.cfg.engine_path, setpgrp=True)
+        engine.configure({"Hash": self.cfg.engine_hash})
+        return engine
+
+    @staticmethod
+    def quit_engine(engine: chess.engine.SimpleEngine | None) -> None:
+        if engine is None:
+            return
+        try:
+            engine.quit()
+        except chess.engine.EngineTerminatedError:
+            pass
+        except Exception:
+            log.exception("engine quit failed")
 
     def play(self) -> None:
-        engine = chess.engine.SimpleEngine.popen_uci(self.cfg.engine_path)
-        engine.configure({"Hash": self.cfg.engine_hash})
+        engine = self.new_engine()
         try:
             stream = self.client.bots.stream_game_state(self.game_id)
             first = next(stream)
@@ -78,7 +97,7 @@ class Game(threading.Thread):
             log.info("game %s: playing %s vs %s", self.game_id, "white" if my_color else "black",
                      (first["black"] if my_color else first["white"]).get("name", "?"))
             self.apply_state(board, first["state"])
-            self.maybe_move(engine, board, my_color, first["state"])
+            engine = self.maybe_move(engine, board, my_color, first["state"])
             for event in stream:
                 kind = event.get("type")
                 if kind == "gameState":
@@ -87,11 +106,11 @@ class Game(threading.Thread):
                     if event.get("status") != "started":
                         log.info("game %s: over (%s)", self.game_id, event.get("status"))
                         break
-                    self.maybe_move(engine, board, my_color, event)
+                    engine = self.maybe_move(engine, board, my_color, event)
                 elif kind == "chatLine" or kind == "opponentGone":
                     continue
         finally:
-            engine.quit()
+            self.quit_engine(engine)
 
     @staticmethod
     def board_from(game_full: dict) -> chess.Board:
@@ -104,9 +123,10 @@ class Game(threading.Thread):
         for uci in moves:
             board.push_uci(uci)
 
-    def maybe_move(self, engine: chess.engine.SimpleEngine, board: chess.Board, my_color: chess.Color, state: dict) -> None:
+    def maybe_move(self, engine: chess.engine.SimpleEngine, board: chess.Board, my_color: chess.Color, state: dict) -> chess.engine.SimpleEngine:
+        """Plays our move if it is our turn. Returns the engine, which is re-spawned if it died."""
         if board.turn != my_color or board.is_game_over():
-            return
+            return engine
         wtime = self.ms(state.get("wtime"))
         btime = self.ms(state.get("btime"))
         winc = self.ms(state.get("winc"))
@@ -116,16 +136,25 @@ class Game(threading.Thread):
         # First move: play fast, clocks are not running yet.
         if len(board.move_stack) < 2:
             limit = chess.engine.Limit(time=0.5)
-        result = engine.play(board, limit)
-        if result.move is None:
-            return
+        result = None
+        for attempt in range(3):
+            try:
+                result = engine.play(board, limit)
+                break
+            except chess.engine.EngineTerminatedError:
+                log.warning("game %s: engine died during search, re-spawning (attempt %d)", self.game_id, attempt + 1)
+                self.quit_engine(engine)
+                engine = self.new_engine()
+        if result is None or result.move is None:
+            return engine
         for attempt in range(3):
             try:
                 self.client.bots.make_move(self.game_id, result.move.uci())
-                return
+                return engine
             except berserk.exceptions.ResponseError as e:
                 log.warning("game %s: move %s rejected (%s), attempt %d", self.game_id, result.move, e, attempt)
                 time.sleep(1)
+        return engine
 
     @staticmethod
     def ms(value) -> int:
@@ -152,13 +181,18 @@ class Bot:
         self.games: dict[str, Game] = {}
         self.lock = threading.Lock()
         self.draining = threading.Event()
+        self.drain_outcomes: dict[str, int] = {}
         self.signals_received = 0
         self.exit = os._exit  # replaced in tests
         log.info("logged in as %s", account.get("username"))
 
-    def game_done(self, game_id: str) -> None:
+    def game_done(self, game_id: str, outcome: str = "finished") -> None:
         with self.lock:
             self.games.pop(game_id, None)
+            if self.draining.is_set():
+                self.drain_outcomes[outcome] = self.drain_outcomes.get(outcome, 0) + 1
+        if outcome != "finished":
+            log.error("game %s ended by %s", game_id, outcome)
 
     def install_signal_handlers(self) -> None:
         for sig in (signal.SIGTERM, signal.SIGINT):
@@ -198,7 +232,8 @@ class Bot:
                         t.join(timeout=10)
                 break
             time.sleep(1)
-        log.info("drained, exiting")
+        crashed = self.drain_outcomes.get("crashed", 0)
+        log.info("drained, exiting (%d finished, %d crashed)", self.drain_outcomes.get("finished", 0), crashed)
         self.exit(0)
 
     def should_accept(self, challenge: dict) -> str | None:

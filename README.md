@@ -49,7 +49,13 @@ clone with `git config core.hooksPath scripts/hooks`.
   -b <topic> main`), never directly in the `main` checkout, so agents working in parallel do
   not disturb each other. Land a branch with a fast-forward merge from the `main` checkout
   (`git merge --ff-only <topic>`); `scripts/hooks/post-merge` then releases each new commit.
-  In a worktree, symlink `.venv`, `data` and `matches` to the main checkout to share them.
+  In a worktree, symlink `.venv`, `data` and `matches` to the main checkout to share them;
+  never replace those directories in the main checkout itself, they hold the only copies
+  of the virtualenv, training data and match results.
+
+A service manager must signal only the bot's main process on stop (systemd:
+`KillMode=mixed`); the engine child runs in its own process group and is re-spawned if
+it dies mid-game, but killing it needlessly costs search time.
 - Release assets: `chessbot-<tag>-linux-aarch64.tar.gz` (`bin/chessbot-engine`, `bot/`,
   `requirements.txt`, `VERSION`) and `SHA256SUMS`. Put a line starting with `MANUAL:` in a
   commit body when deploying it needs a manual step; it is hoisted to the top of the notes.

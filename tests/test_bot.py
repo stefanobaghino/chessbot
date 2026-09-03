@@ -28,6 +28,7 @@ def make_bot(timeout=30.0):
     b.games = {}
     b.lock = threading.Lock()
     b.draining = threading.Event()
+    b.drain_outcomes = {}
     b.signals_received = 0
     b.exits = []
     b.exit = b.exits.append
@@ -84,3 +85,61 @@ def test_drain_timeout_resigns():
     time.sleep(3.5)
     assert ("resign", "g9") in b.client.bots.calls
     assert b.exits == [0]
+
+
+class DeadEngine:
+    def play(self, board, limit):
+        import chess.engine
+
+        raise chess.engine.EngineTerminatedError("dead")
+
+    def quit(self):
+        import chess.engine
+
+        raise chess.engine.EngineTerminatedError("dead")
+
+
+class LiveEngine:
+    def __init__(self):
+        self.played = 0
+
+    def play(self, board, limit):
+        import chess
+
+        self.played += 1
+        return chess.engine.PlayResult(next(iter(board.legal_moves)), None)
+
+    def quit(self):
+        pass
+
+
+def test_engine_is_respawned_mid_game():
+    import chess
+
+    g = Game.__new__(Game)
+    g.game_id = "g1"
+    g.client = type("Client", (), {})()
+    g.client.bots = FakeBots()
+    g.client.bots.make_move = lambda gid, uci: None
+    live = LiveEngine()
+    g.new_engine = lambda: live
+    board = chess.Board()
+    engine = g.maybe_move(DeadEngine(), board, chess.WHITE, {"wtime": 60000, "btime": 60000})
+    assert engine is live
+    assert live.played == 1
+
+
+def test_quit_engine_tolerates_dead_engine():
+    Game.quit_engine(DeadEngine())
+    Game.quit_engine(None)
+
+
+def test_game_done_records_drain_outcomes():
+    b = make_bot()
+    b.drain_outcomes = {}
+    b.games["g1"] = threading.Thread()
+    b.games["g2"] = threading.Thread()
+    b.draining.set()
+    b.game_done("g1", "crashed")
+    b.game_done("g2")
+    assert b.drain_outcomes == {"crashed": 1, "finished": 1}

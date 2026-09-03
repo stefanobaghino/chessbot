@@ -283,5 +283,9 @@ fn main() {
         }
         io::stdout().flush().ok();
     }
+    // stdin closed: behave like "quit" so shell pipelines terminate.
+    stop.store(true, Ordering::Relaxed);
+    tx.send(Cmd::Quit).ok();
+    drop(tx);
     worker.join().ok();
 }
