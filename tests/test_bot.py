@@ -1,4 +1,5 @@
 import datetime
+import logging
 import signal
 import threading
 import time
@@ -365,6 +366,36 @@ def test_send_move_treats_not_your_turn_as_accepted(monkeypatch):
                           "json": lambda self: {"error": "Not your turn, or game already over"}})()
     g.client.bots.make_move = lambda gid, uci: (_ for _ in ()).throw(berserk.exceptions.ResponseError(resp))
     g.send_move("e2e4")
+
+
+def test_send_move_distinguishes_game_over_from_lost_response(monkeypatch, caplog):
+    import berserk
+
+    monkeypatch.setattr(time, "sleep", lambda s: None)
+    resp = type("R", (), {"status_code": 400, "reason": "Bad Request", "text": '{"error":"Not your turn, or game already over"}',
+                          "json": lambda self: {"error": "Not your turn, or game already over"}})()
+    # First attempt rejected: the game ended (e.g. threefold repetition) while we searched.
+    g = make_game()
+    g.client.bots.make_move = lambda gid, uci: (_ for _ in ()).throw(berserk.exceptions.ResponseError(resp))
+    with caplog.at_level(logging.INFO, logger="chessbot"):
+        g.send_move("e2e4")
+    assert "the game is over or it is not our turn" in caplog.text
+    caplog.clear()
+    # Transport error, then the retry finds the move already on the board: it was accepted.
+    g = make_game()
+    calls = []
+
+    def make_move(gid, uci):
+        calls.append(uci)
+        if len(calls) == 1:
+            raise berserk.exceptions.ApiError(ConnectionError("Remote end closed connection"))
+        raise berserk.exceptions.ResponseError(resp)
+
+    g.client.bots.make_move = make_move
+    with caplog.at_level(logging.INFO, logger="chessbot"):
+        g.send_move("e2e4")
+    assert calls == ["e2e4"] * 2
+    assert "accepted by an earlier attempt" in caplog.text
 
 
 def test_play_reconnects_stream_after_transport_error(monkeypatch):

@@ -264,7 +264,16 @@ class Game(threading.Thread):
             except berserk.exceptions.ResponseError as e:
                 text = str(e).lower()
                 if "not your turn" in text or "already" in text:
-                    log.info("game %s: move %s was already accepted", self.game_id, uci)
+                    # Lichess answers "Not your turn, or game already over" both when a
+                    # retry follows a lost response (the move was accepted) and when the
+                    # game ended while we were searching, typically an automatic
+                    # threefold-repetition draw after the opponent's move (issue #13).
+                    # Either way there is nothing left to send.
+                    if attempt > 1:
+                        log.info("game %s: move %s was accepted by an earlier attempt", self.game_id, uci)
+                    else:
+                        log.info("game %s: move %s not sent, the game is over or it is not our turn (%s)",
+                                 self.game_id, uci, e)
                     return
                 last = e
                 log.warning("game %s: move %s rejected (%s), attempt %d", self.game_id, uci, e, attempt)
