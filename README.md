@@ -43,6 +43,12 @@ writes a PGN and log under `matches/`.
 scripts/match.sh 2000 100 10+0.1 3 goal
 ```
 
+`scripts/relabel_chunks.sh data/x.fens data/x_d10 10` relabels positions with Stockfish at
+depth 10 in resumable 50k chunks (`x_d10_<i>.npz`, pass them comma-separated to
+`train/train.py`), starting a chunk only if it can finish before 21:00; rerun the same
+command after 09:00 to resume. `train/fens_diff.py` picks the positions of self-play batches
+that have not been labelled yet.
+
 `scripts/blunders.py matches/<run>.pgn` lists the moves that lost the most in each
 lost game, `scripts/evalsym.py` checks that the static evaluation is colour-symmetric.
 
