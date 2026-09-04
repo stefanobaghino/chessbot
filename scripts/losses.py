@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 """Classify why games were lost: for each lost game find the first move that turned a
 holdable position into a lost one (Stockfish at fixed depth), then say whether our engine
 would have avoided it with a deeper search (search miss) or still plays it (eval miss).
