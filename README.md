@@ -17,6 +17,22 @@ cd engine && cargo build --release
 ./target/release/chessbot-engine bench 10
 ```
 
+## Release
+
+Every commit is validated by the `pre-commit` hook (`scripts/validate.sh`: engine
+build, tests, bench, NNUE self-check, ruff, pytest). Releases are deliberate:
+on `main`, run
+
+```
+scripts/release.sh
+```
+
+It validates `HEAD` again, signs the next `v*` tag, pushes `main` and the tag,
+and publishes a GitHub Release whose notes cover every commit since the previous
+tag (`MANUAL:` lines in commit messages are hoisted to the top). The `pre-push`
+hook refuses to push an untagged `main`, so this is the only way commits reach
+GitHub. Logs land in `ci/logs/`, the last outcome in `ci/last_result`.
+
 ## Measure strength
 
 `scripts/match.sh [elo] [games] [tc] [concurrency] [name]` plays the engine against
