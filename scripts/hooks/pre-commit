@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+# Validate the staged tree with scripts/validate.sh before every commit.
+# Runs on an export of the index (not the working tree) so unstaged edits
+# cannot mask or cause failures. Skip with `git commit --no-verify`.
+set -euo pipefail
+ROOT="$(git rev-parse --show-toplevel)"
+work=$(mktemp -d "${TMPDIR:-/tmp}/chessbot-precommit.XXXXXX")
+trap 'rm -rf "$work"' EXIT
+mkdir -p "$work/src"
+git archive "$(git write-tree)" | tar -x -C "$work/src"
+# Keep off the live bot's cores (0-1); see README "Sharing the machine with the live bot".
+SPAR_CPUS="${SPAR_CPUS:-2-3}"
+if taskset -c "$SPAR_CPUS" "$ROOT/scripts/validate.sh" "$work/src" precommit > "$work/log" 2>&1; then
+  echo "pre-commit: validate ok"
+else
+  tr '\r' '\n' < "$work/log" | tail -30
+  echo "pre-commit: validate FAILED (fix, or commit with --no-verify)"
+  exit 1
+fi
