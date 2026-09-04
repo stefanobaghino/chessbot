@@ -3,7 +3,7 @@
 
 use cozy_chess::{Board, Color, File, Move, Piece, Rank, Square};
 
-pub const HIDDEN: usize = 256;
+pub const HIDDEN: usize = 384;
 const QA: i32 = 255;
 const QB: i32 = 64;
 const SCALE: i32 = 400;
