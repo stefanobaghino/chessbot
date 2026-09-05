@@ -1,8 +1,18 @@
 """Train a (768 -> N)x2 -> 1 NNUE with SCReLU and export quantised weights.
 
 Usage: train.py data.npz out.bin [--hidden 256] [--epochs 20] [--batch 16384] [--lr 1e-3]
+                [--checkpoint out.bin.ckpt] [--window 9-21]
+
+The full training state (weights, optimiser, LR schedule, RNG, data split) is saved to the
+checkpoint after every epoch and picked up again by the same command, so a run can be
+stopped and resumed. With --window H1-H2 an epoch is only started when it is expected to
+finish inside that daily window (estimate: the previous epoch's duration), and the process
+exits with status 3 otherwise; run the same command again after the window opens.
 """
 import argparse
+import datetime as dt
+import os
+import sys
 import time
 
 import numpy as np
@@ -82,6 +92,21 @@ def export(net: Net, path: str):
     print(f"exported {path}: hidden={w0.shape[1]} w0 range [{w0.min()},{w0.max()}] w1 range [{w1.min()},{w1.max()}] b1={b1[0]}")
 
 
+def parse_window(spec: str | None) -> tuple[int, int] | None:
+    if not spec:
+        return None
+    start, _, end = spec.partition("-")
+    return int(start), int(end)
+
+
+def window_allows(window: tuple[int, int], est_seconds: float, now: dt.datetime | None = None) -> bool:
+    """True if an epoch estimated at est_seconds, started now, ends inside today's window."""
+    now = now or dt.datetime.now().astimezone()  # local wall clock, the window is a local rule
+    start = now.replace(hour=window[0], minute=0, second=0, microsecond=0)
+    end = now.replace(hour=window[1], minute=0, second=0, microsecond=0)
+    return start <= now and now + dt.timedelta(seconds=est_seconds) <= end
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("data", help="comma-separated list of .npz files")
@@ -91,9 +116,13 @@ def main():
     ap.add_argument("--batch", type=int, default=16384)
     ap.add_argument("--lr", type=float, default=1e-3)
     ap.add_argument("--threads", type=int, default=4)
-    ap.add_argument("--resume", default=None)
+    ap.add_argument("--resume", default=None, help="initialise the weights from this .pt file")
     ap.add_argument("--limit", type=int, default=0)
+    ap.add_argument("--checkpoint", default=None, help="full-state checkpoint, default <out>.ckpt")
+    ap.add_argument("--window", default=None, help="hours H1-H2 inside which epochs may run, e.g. 9-21")
     args = ap.parse_args()
+    ckpt_path = args.checkpoint or args.out + ".ckpt"
+    window = parse_window(args.window)
     torch.set_num_threads(args.threads)
     torch.manual_seed(0)
 
@@ -116,6 +145,22 @@ def main():
         net.load_state_dict(torch.load(args.resume))
     opt = torch.optim.Adam(net.parameters(), lr=args.lr)
     sched = torch.optim.lr_scheduler.StepLR(opt, step_size=max(1, args.epochs // 3), gamma=0.3)
+    first_epoch, est = 0, 0.0
+    key = {"data": args.data, "hidden": args.hidden, "epochs": args.epochs, "n": n}
+    if os.path.exists(ckpt_path):
+        ck = torch.load(ckpt_path, weights_only=False)
+        if ck["key"] != key:
+            sys.exit(f"{ckpt_path} was written by a different run ({ck['key']} != {key}); remove it to start over")
+        net.load_state_dict(ck["net"])
+        opt.load_state_dict(ck["opt"])
+        sched.load_state_dict(ck["sched"])
+        rng.bit_generator.state = ck["rng"]
+        train_idx = ck["train_idx"]
+        first_epoch, est = ck["epoch"], ck["epoch_seconds"]
+        print(f"resumed from {ckpt_path} after epoch {first_epoch}/{args.epochs}", flush=True)
+        if first_epoch >= args.epochs:
+            print("nothing left to do", flush=True)
+            return
 
     def batch_loss(idx):
         us_i, us_o, th_i, th_o = features(pieces[idx], stm[idx])
@@ -123,7 +168,10 @@ def main():
         pred = torch.sigmoid(net(us_i, us_o, th_i, th_o))
         return ((pred - target) ** 2).mean()
 
-    for epoch in range(args.epochs):
+    for epoch in range(first_epoch, args.epochs):
+        if window and not window_allows(window, est):
+            print(f"epoch {epoch + 1}/{args.epochs} would not finish inside {args.window} (est {est / 60:.0f} min); stopping", flush=True)
+            sys.exit(3)
         t0 = time.time()
         rng.shuffle(train_idx)
         net.train()
@@ -144,6 +192,12 @@ def main():
         print(f"epoch {epoch + 1}/{args.epochs} train {total / nb:.5f} val {vl:.5f} lr {sched.get_last_lr()[0]:.1e} {time.time() - t0:.0f}s", flush=True)
         torch.save(net.state_dict(), args.out + ".pt")
         export(net, args.out)
+        est = time.time() - t0
+        state = {"key": key, "epoch": epoch + 1, "epoch_seconds": est, "net": net.state_dict(),
+                 "opt": opt.state_dict(), "sched": sched.state_dict(), "rng": rng.bit_generator.state,
+                 "train_idx": train_idx}
+        torch.save(state, ckpt_path + ".tmp")
+        os.replace(ckpt_path + ".tmp", ckpt_path)
 
 
 if __name__ == "__main__":

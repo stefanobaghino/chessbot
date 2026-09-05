@@ -47,7 +47,11 @@ scripts/match.sh 2000 100 10+0.1 3 goal
 depth 10 in resumable 50k chunks (`x_d10_<i>.npz`, pass them comma-separated to
 `train/train.py`), starting a chunk only if it can finish before 21:00; rerun the same
 command after 09:00 to resume. `train/fens_diff.py` picks the positions of self-play batches
-that have not been labelled yet.
+that have not been labelled yet. `train/train.py` saves its full state to `<out>.ckpt` after
+every epoch and resumes from it when run again with the same arguments; with `--window 9-21`
+it exits with status 3 instead of starting an epoch that would end after 21:00.
+`scripts/train_net6.sh` is the net6 job built on both: a no-op until every relabel chunk
+exists, otherwise it trains (or resumes) inside the window.
 
 `scripts/blunders.py matches/<run>.pgn` lists the moves that lost the most in each
 lost game, `scripts/evalsym.py` checks that the static evaluation is colour-symmetric.
