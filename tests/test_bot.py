@@ -34,6 +34,7 @@ def make_bot(timeout=30.0):
     b.stream_failures = 0
     b.last_line_at = None
     b.finished_at = []
+    b.clock_history = []
     b.pending_challenge = None
     b.skip_until = {}
     b.my_rating = 2000
@@ -205,7 +206,7 @@ def idle_bot(**cfg):
     b.skip_until = {}
     b.my_rating = 2000
     b.stream_ok = True
-    defaults = {"idle_clock": (300, 3), "idle_rated": True, "idle_max_per_day": 80, "idle_gap": 720.0,
+    defaults = {"idle_clock": (300, 3), "idle_clocks": [((300, 3), 1)], "idle_rated": True, "idle_max_per_day": 80, "idle_gap": 720.0,
                 "idle_rating_range": 500, "idle_min_games": 50, "idle_accept_timeout": 0.5, "idle_pause_file": None,
                 "idle_challenge": True}
     b.idle_paused = False
@@ -574,3 +575,68 @@ def test_login_gives_up_after_the_deadline(monkeypatch):
     with pytest.raises(requests.exceptions.ConnectionError):
         b.login(10.0, sleep=sleep)
     assert now[0] == 10.0
+
+
+def test_parse_idle_clocks():
+    from bot.lichess_bot import idle_clock_spec, parse_idle_clocks
+
+    assert parse_idle_clocks("300+3") == [((300, 3), 1)]
+    assert parse_idle_clocks("120+1:8, 300+3:3,900+10:1") == [((120, 1), 8), ((300, 3), 3), ((900, 10), 1)]
+    assert idle_clock_spec(parse_idle_clocks("120+1:8,300+3:3")) == "120+1:8,300+3:3"
+    assert idle_clock_spec(parse_idle_clocks("120+1")) == "120+1"
+    for bad in ("", "120+1:0", "abc", "120+1:x"):
+        try:
+            parse_idle_clocks(bad)
+        except ValueError:
+            continue
+        raise AssertionError(bad)
+
+
+def test_next_idle_clock_follows_the_weights():
+    b = idle_bot(idle_clocks=[((120, 1), 8), ((300, 3), 3), ((900, 10), 1)])
+    picks = []
+    for _ in range(12):
+        clock = b.next_idle_clock()
+        picks.append(clock)
+        b.clock_history.append((time.monotonic(), clock))
+    assert picks[0] == (120, 1)
+    assert sorted(picks.count(c) for c in {(120, 1), (300, 3), (900, 10)}) == [1, 3, 8]
+    # Games older than 24 h and clocks outside the list do not count.
+    b.clock_history = [(time.monotonic() - 90000, (300, 3))] * 5 + [(time.monotonic(), (60, 0))] * 5
+    assert b.next_idle_clock() == (120, 1)
+    # Incoming games with a listed clock count towards its share.
+    b.clock_history = [(time.monotonic(), (120, 1))] * 8
+    assert b.next_idle_clock() == (300, 3)
+    assert idle_bot().next_idle_clock() == (300, 3)
+
+
+def test_game_done_records_the_clock():
+    b = make_bot()
+    g = Game.__new__(Game)
+    g.clock = (120, 1)
+    b.games["g1"] = g
+    b.game_done("g1")
+    assert [c for _, c in b.clock_history] == [(120, 1)]
+    b.games["g2"] = threading.Thread()
+    b.game_done("g2")
+    assert len(b.clock_history) == 1
+
+
+def test_game_reads_the_clock_from_gamefull():
+    g = Game.__new__(Game)
+    g.my_id = "me"
+    g.game_id = "g"
+    g.clock = None
+    calls = []
+
+    class Bots:
+        def stream_game_state(self, gid):
+            yield {"type": "gameFull", "clock": {"initial": datetime.timedelta(seconds=120), "increment": 1000},
+                   "white": {"id": "me"}, "black": {"name": "x"}, "initialFen": "startpos",
+                   "state": {"moves": "", "status": "mate"}}
+
+    g.client = type("C", (), {"bots": Bots()})()
+    g.apply_state = lambda board, state: calls.append(state)
+    g.board_from = lambda first: __import__("chess").Board()
+    g.play_stream(None)
+    assert g.clock == (120, 1)

@@ -14,7 +14,9 @@ DOTENV_PATH (default: <repo>/.env) without overriding variables already set:
                  and reconnected (default 90)
   HEARTBEAT_INTERVAL  seconds between "alive:" log lines (default 300)
   IDLE_CHALLENGE  1 to challenge an online bot whenever idle (default 0)
-  IDLE_CLOCK      clock for those games as seconds+increment (default 300+3)
+  IDLE_CLOCK      clock for those games as seconds+increment (default 300+3), or a
+                 weighted list such as 120+1:8,300+3:3,900+10:1: the next game gets the
+                 clock furthest below its share of the bot games of the trailing 24 h
   IDLE_RATED      1 for rated (default 1)
   IDLE_MAX_PER_DAY  cap on games finished in the trailing 24 h, incoming ones included
                  (default 80); bot challenges are declined once it is reached
@@ -67,6 +69,25 @@ ACCEPTED_VARIANTS = {"standard", "fromPosition"}
 ACCEPTED_SPEEDS = {"bullet", "blitz", "rapid", "classical"}
 
 
+def parse_idle_clocks(spec: str) -> list[tuple[tuple[int, int], int]]:
+    """Parses IDLE_CLOCK: comma-separated `seconds+increment[:weight]` entries."""
+    clocks = []
+    for entry in spec.split(","):
+        clock, _, weight = entry.strip().partition(":")
+        limit, _, inc = clock.partition("+")
+        weight = int(weight or 1)
+        if weight <= 0:
+            raise ValueError(f"bad weight in IDLE_CLOCK entry {entry!r}")
+        clocks.append(((int(limit), int(inc or 0)), weight))
+    if not clocks:
+        raise ValueError("IDLE_CLOCK is empty")
+    return clocks
+
+
+def idle_clock_spec(clocks: list[tuple[tuple[int, int], int]]) -> str:
+    return ",".join(f"{limit}+{inc}" + (f":{w}" if len(clocks) > 1 else "") for (limit, inc), w in clocks)
+
+
 class Config:
     def __init__(self) -> None:
         self.dotenv_path = os.environ.get("DOTENV_PATH", str(ROOT / ".env"))
@@ -90,9 +111,10 @@ class Config:
 
     def read_idle(self, env: Mapping[str, str | None]) -> None:
         """Sets the idle-challenge settings from `env`; on a bad value nothing changes."""
-        limit, _, inc = (env.get("IDLE_CLOCK") or "300+3").partition("+")
+        clocks = parse_idle_clocks(env.get("IDLE_CLOCK") or "300+3")
         values = {
-            "idle_clock": (int(limit), int(inc or 0)),
+            "idle_clocks": clocks,
+            "idle_clock": clocks[0][0],
             "idle_rated": (env.get("IDLE_RATED") or "1") == "1",
             "idle_max_per_day": int(env.get("IDLE_MAX_PER_DAY") or "80"),
             "idle_gap": float(env.get("IDLE_GAP_SECONDS") or "720"),
@@ -112,7 +134,7 @@ class Config:
         self.read_idle(env)
 
     def idle_summary(self) -> str:
-        return (f"clock={self.idle_clock[0]}+{self.idle_clock[1]} rated={int(self.idle_rated)} "
+        return (f"clock={idle_clock_spec(self.idle_clocks)} rated={int(self.idle_rated)} "
                 f"max_per_day={self.idle_max_per_day} gap={self.idle_gap:.0f}s tick={self.idle_tick:.0f}s "
                 f"rating_range={self.idle_rating_range} min_games={self.idle_min_games} "
                 f"accept_timeout={self.idle_accept_timeout:.0f}s pause_file={self.idle_pause_file}")
@@ -165,6 +187,7 @@ class Game(threading.Thread):
         self.my_id = my_id
         self.cfg = cfg
         self.on_done = on_done
+        self.clock: tuple[int, int] | None = None  # (seconds, increment) once gameFull arrived
 
     def run(self) -> None:
         outcome = "finished"
@@ -221,6 +244,9 @@ class Game(threading.Thread):
             log.warning("game %s: unexpected first event %s", self.game_id, first.get("type"))
             return engine
         board = self.board_from(first)
+        clock = first.get("clock") or {}
+        if "initial" in clock:
+            self.clock = (self.ms(clock["initial"]) // 1000, self.ms(clock.get("increment")) // 1000)
         my_color = chess.WHITE if first["white"].get("id") == self.my_id else chess.BLACK
         opponent = (first["black"] if my_color else first["white"]).get("name", "?")
         log.info("game %s: playing %s vs %s", self.game_id, "white" if my_color else "black", opponent)
@@ -343,6 +369,7 @@ class Bot:
         self.stream_ok = False
         self.last_line_at: float | None = None
         self.finished_at: list[float] = []
+        self.clock_history: list[tuple[float, tuple[int, int]]] = []  # (monotonic end, clock) of bot games, 24 h
         self.pending_challenge: str | None = None
         self.idle_paused = False
         self.idle_pause_logged: str | None = None
@@ -370,7 +397,10 @@ class Bot:
 
     def game_done(self, game_id: str, outcome: str = "finished") -> None:
         with self.lock:
-            self.games.pop(game_id, None)
+            g = self.games.pop(game_id, None)
+            clock = getattr(g, "clock", None)
+            if clock:
+                self.clock_history.append((time.monotonic(), clock))
             if self.draining.is_set():
                 self.drain_outcomes[outcome] = self.drain_outcomes.get(outcome, 0) + 1
         if outcome != "finished":
@@ -424,11 +454,13 @@ class Bot:
         now_mono = time.monotonic()
         since_ms = int((now_wall - 86400) * 1000)
         stamps = []
+        clocks: list[tuple[float, tuple[int, int]]] = []
         for g in self.client.games.export_by_player(self.my_id, since=since_ms, max=200, moves=False, finished=True):
             players = g.get("players", {})
             opp = players.get("black" if players.get("white", {}).get("user", {}).get("id") == self.my_id else "white", {})
             if opp.get("user", {}).get("title") != "BOT":
                 continue
+            clock = g.get("clock") or {}
             ended = g.get("lastMoveAt") or g.get("createdAt")
             if hasattr(ended, "timestamp"):
                 ended = ended.timestamp()
@@ -437,8 +469,11 @@ class Bot:
             else:
                 continue
             stamps.append(now_mono - (now_wall - ended))
+            if "initial" in clock:
+                clocks.append((stamps[-1], (int(clock["initial"]), int(clock.get("increment") or 0))))
         with self.lock:
             self.finished_at = sorted(stamps)
+            self.clock_history = sorted(clocks)
         return len(stamps)
 
     def refresh_game_counter(self) -> None:
@@ -569,6 +604,27 @@ class Bot:
         # Prefer close ratings but vary the opponent.
         return random.choice(candidates[:8])[1]
 
+    def next_idle_clock(self) -> tuple[int, int]:
+        """The configured clock furthest below its weighted share of the bot games of the
+        trailing 24 h (deficit selection); with one clock configured, that clock."""
+        clocks = self.cfg.idle_clocks
+        if len(clocks) == 1:
+            return clocks[0][0]
+        cutoff = time.monotonic() - 86400
+        with self.lock:
+            self.clock_history = [h for h in self.clock_history if h[0] >= cutoff]
+            counts = {clock: 0 for clock, _ in clocks}
+            for _, clock in self.clock_history:
+                if clock in counts:
+                    counts[clock] += 1
+        total_weight = sum(w for _, w in clocks)
+        played = sum(counts.values()) + 1  # including the game about to be played
+        deficit = {clock: w / total_weight * played - counts[clock] for clock, w in clocks}
+        limit, inc = max(clocks, key=lambda c: deficit[c[0]])[0]
+        log.info("idle: next clock %s+%s (24h counts %s)", limit, inc,
+                 " ".join(f"{c[0]}+{c[1]}={n}" for c, n in counts.items()))
+        return limit, inc
+
     def idle_pause_reason(self) -> str | None:
         if self.idle_paused:
             return "SIGUSR1"
@@ -603,7 +659,7 @@ class Bot:
         if opp is None:
             log.info("idle: no suitable opponent among %d online bots", len(bots))
             return False
-        limit, inc = self.cfg.idle_clock
+        limit, inc = self.next_idle_clock()
         try:
             ch = self.client.challenges.create(opp["id"], rated=self.cfg.idle_rated, clock_limit=limit, clock_increment=inc)
         except Exception as e:  # noqa: BLE001
@@ -647,7 +703,7 @@ class Bot:
     def run(self) -> None:
         log.info("waiting for challenges (max %d concurrent games)", self.cfg.max_games)
         if self.cfg.idle_challenge:
-            log.info("idle challenges enabled: %s+%s %s, max %d/day, gap %.0fs", self.cfg.idle_clock[0], self.cfg.idle_clock[1],
+            log.info("idle challenges enabled: %s %s, max %d/day, gap %.0fs", idle_clock_spec(self.cfg.idle_clocks),
                      "rated" if self.cfg.idle_rated else "casual", self.cfg.idle_max_per_day, self.cfg.idle_gap)
             self.refresh_game_counter()
             threading.Thread(target=self.idle_loop, name="idle", daemon=True).start()
