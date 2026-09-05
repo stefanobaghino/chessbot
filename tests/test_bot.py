@@ -528,3 +528,49 @@ def test_sighup_reloads_idle_settings_from_dotenv(tmp_path, monkeypatch):
     monkeypatch.setenv("IDLE_MAX_PER_DAY", "10")
     b.on_reload_idle(signal.SIGHUP, None)
     assert cfg.idle_clock == (300, 3) and cfg.idle_max_per_day == 10
+
+
+def test_login_retries_transport_errors_until_the_deadline(caplog):
+    import requests
+
+    b = make_bot()
+    calls = []
+
+    class Account:
+        def get(self):
+            calls.append(1)
+            if len(calls) < 3:
+                raise requests.exceptions.ConnectionError("Failed to resolve 'lichess.org'")
+            return {"id": "me", "title": "BOT"}
+
+    b.client.account = Account()
+    slept = []
+    with caplog.at_level(logging.WARNING):
+        account = b.login(60.0, sleep=slept.append)
+    assert account["id"] == "me"
+    assert len(calls) == 3
+    assert slept == [2.0, 4.0]
+    assert [r.levelname for r in caplog.records] == ["WARNING", "WARNING"]
+    assert "login attempt 1 failed (ConnectionError" in caplog.text
+
+
+def test_login_gives_up_after_the_deadline(monkeypatch):
+    import pytest
+    import requests
+
+    b = make_bot()
+
+    class Account:
+        def get(self):
+            raise requests.exceptions.ConnectionError("still down")
+
+    b.client.account = Account()
+    now = [0.0]
+    monkeypatch.setattr("bot.lichess_bot.time.monotonic", lambda: now[0])
+
+    def sleep(s):
+        now[0] += s
+
+    with pytest.raises(requests.exceptions.ConnectionError):
+        b.login(10.0, sleep=sleep)
+    assert now[0] == 10.0

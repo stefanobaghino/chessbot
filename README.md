@@ -52,6 +52,8 @@ every epoch and resumes from it when run again with the same arguments; with `--
 it exits with status 3 instead of starting an epoch that would end after 21:00.
 `scripts/train_net6.sh` is the net6 job built on both: a no-op until every relabel chunk
 exists, otherwise it trains (or resumes) inside the window.
+`scripts/install_timers.sh` installs both as persistent daily user timers (09:00 and 09:05,
+`CPUQuota=200%`, i.e. half of the four cores) that survive a reboot; `--uninstall` removes them.
 
 `scripts/blunders.py matches/<run>.pgn` lists the moves that lost the most in each
 lost game, `scripts/evalsym.py` checks that the static evaluation is colour-symmetric.

@@ -80,6 +80,7 @@ class Config:
         self.max_games = int(os.environ.get("MAX_GAMES", "1"))
         self.shutdown_timeout = float(os.environ.get("SHUTDOWN_TIMEOUT", "900"))
         self.stream_read_timeout = float(os.environ.get("STREAM_READ_TIMEOUT", "90"))
+        self.login_timeout = float(os.environ.get("LOGIN_TIMEOUT", "300"))
         self.heartbeat_interval = float(os.environ.get("HEARTBEAT_INTERVAL", "300"))
         self.idle_challenge = os.environ.get("IDLE_CHALLENGE", "0") == "1"
         self.read_idle(os.environ)
@@ -330,7 +331,7 @@ class Bot:
         session = TimeoutSession(cfg.token, cfg.stream_read_timeout)
         self.session = session
         self.client = berserk.Client(session=session)
-        account = self.client.account.get()
+        account = self.login(cfg.login_timeout)
         self.my_id = account["id"]
         if account.get("title") != "BOT":
             sys.exit(f"account {self.my_id} is not a BOT account; run scripts/upgrade_to_bot.py first")
@@ -350,6 +351,22 @@ class Bot:
         self.signals_received = 0
         self.exit = os._exit  # replaced in tests
         log.info("logged in as %s", account.get("username"))
+
+    def login(self, timeout: float, sleep=time.sleep) -> dict:
+        """Fetches the account, retrying transport errors (DNS not up yet after a reboot) for up to `timeout` s."""
+        deadline = time.monotonic() + timeout
+        delay = 2.0
+        for attempt in range(1, 1000):
+            try:
+                return self.client.account.get()
+            except Game.TRANSIENT as e:
+                left = deadline - time.monotonic()
+                if left <= 0:
+                    raise
+                log.warning("login attempt %d failed (%s: %s); retrying in %.0fs", attempt, type(e).__name__, e, min(delay, left))
+                sleep(min(delay, left))
+                delay = min(delay * 2, 30.0)
+        raise RuntimeError("unreachable")
 
     def game_done(self, game_id: str, outcome: str = "finished") -> None:
         with self.lock:
