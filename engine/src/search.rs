@@ -14,6 +14,7 @@ use std::time::{Duration, Instant};
 pub const MATE: i32 = 30000;
 pub const MATE_IN_MAX: i32 = MATE - 1000;
 pub const MAX_PLY: usize = 128;
+const NULL_MOVE: Move = Move { from: Square::A1, to: Square::A1, promotion: None };
 const INF: i32 = 32001;
 
 #[derive(Clone, Default, Debug)]
@@ -40,7 +41,7 @@ pub struct MoveList {
 
 impl MoveList {
     fn new() -> Self {
-        MoveList { moves: [Move { from: Square::A1, to: Square::A1, promotion: None }; 256], scores: [0; 256], len: 0 }
+        MoveList { moves: [NULL_MOVE; 256], scores: [0; 256], len: 0 }
     }
     #[inline]
     fn push(&mut self, mv: Move) {
@@ -103,6 +104,9 @@ pub struct Searcher {
     node_limit: Option<u64>,
     aborted: bool,
     lmr: [[i32; 64]; 64],
+    /// Quiet moves and captures tried at each ply of the current line, see `negamax`.
+    tried_quiets: Box<[[Move; 256]]>,
+    tried_captures: Box<[[(Move, Piece); 256]]>,
 }
 
 fn is_insufficient(board: &Board) -> bool {
@@ -211,7 +215,8 @@ pub fn see(board: &Board, mv: Move) -> i32 {
     gain[0]
 }
 
-fn gen_moves(board: &Board, list: &mut MoveList, captures_only: bool) {
+/// Pseudo-ordered move generation; `skip` leaves out a move that was already searched.
+fn gen_moves(board: &Board, list: &mut MoveList, captures_only: bool, skip: Option<Move>) {
     let stm = board.side_to_move();
     let enemy = board.colors(!stm);
     let ep_bb = board
@@ -228,6 +233,9 @@ fn gen_moves(board: &Board, list: &mut MoveList, captures_only: bool) {
         }
         for mv in pm {
             if captures_only && mv.promotion.is_some() && mv.promotion != Some(Piece::Queen) {
+                continue;
+            }
+            if Some(mv) == skip {
                 continue;
             }
             list.push(mv);
@@ -284,6 +292,8 @@ impl Searcher {
             node_limit: None,
             aborted: false,
             lmr,
+            tried_quiets: vec![[NULL_MOVE; 256]; MAX_PLY].into_boxed_slice(),
+            tried_captures: vec![[(NULL_MOVE, Piece::Pawn); 256]; MAX_PLY].into_boxed_slice(),
         }
     }
 
@@ -457,7 +467,7 @@ impl Searcher {
         self.ss_eval = [NONE_EVAL; MAX_PLY + 4];
 
         let mut list = MoveList::new();
-        gen_moves(board, &mut list, false);
+        gen_moves(board, &mut list, false, None);
         if list.len == 0 {
             return None;
         }
@@ -803,21 +813,41 @@ impl Searcher {
         }
 
         let mut list = MoveList::new();
-        gen_moves(board, &mut list, false);
-        self.score_moves(board, &mut list, tt_move, ply);
-
         let orig_alpha = alpha;
         let mut best_score = -INF;
         let mut best_move: Option<Move> = None;
-        let mut quiets_tried: Vec<Move> = Vec::with_capacity(16);
-        let mut captures_tried: Vec<(Move, Piece)> = Vec::with_capacity(8);
+        // Moves tried at this node, for the history malus on a cutoff. Kept in per-ply
+        // buffers owned by the searcher so no node allocates. The singular verification
+        // search reuses this ply's buffers, which is harmless: it runs on the hash move,
+        // always the first move picked, before anything has been recorded here.
+        let mut n_quiets = 0usize;
+        let mut n_captures = 0usize;
         let mut moves_searched = 0;
         let mut legal = 0;
         let futility_margin = static_eval + 100 + 110 * depth;
         let lmp_limit = if improving { 4 + 2 * depth * depth } else { 2 + depth * depth };
 
-        for i in 0..list.len {
-            let (mv, mscore) = list.pick(i);
+        // The hash move is searched before anything is generated: most nodes cut on it,
+        // and generating and scoring the rest (continuation history lookups included)
+        // is wasted there. The remaining moves keep their usual order.
+        let mut generated = false;
+        let mut i = 0usize;
+        let first = usize::from(tt_move.is_some());
+        loop {
+            let (mv, mscore) = if i < first {
+                (tt_move.unwrap(), 1 << 30)
+            } else {
+                if !generated {
+                    gen_moves(board, &mut list, false, tt_move);
+                    self.score_moves(board, &mut list, None, ply);
+                    generated = true;
+                }
+                if i - first >= list.len {
+                    break;
+                }
+                list.pick(i - first)
+            };
+            i += 1;
             if Some(mv) == excluded {
                 continue;
             }
@@ -929,14 +959,16 @@ impl Searcher {
                                 }
                             }
                             self.update_quiet_stats(board, mv, ply, bonus);
-                            for &q in &quiets_tried {
+                            for i in 0..n_quiets {
+                                let q = self.tried_quiets[ply][i];
                                 self.update_quiet_stats(board, q, ply, -bonus);
                             }
                         } else if let Some(v) = victim {
                             let idx = Self::capt_index(board, mv, v);
                             Self::gravity(&mut self.capt_hist[idx], bonus);
                         }
-                        for &(c, v) in &captures_tried {
+                        for i in 0..n_captures {
+                            let (c, v) = self.tried_captures[ply][i];
                             let idx = Self::capt_index(board, c, v);
                             Self::gravity(&mut self.capt_hist[idx], -bonus);
                         }
@@ -945,9 +977,11 @@ impl Searcher {
                 }
             }
             if quiet {
-                quiets_tried.push(mv);
+                self.tried_quiets[ply][n_quiets] = mv;
+                n_quiets += 1;
             } else if let Some(v) = victim {
-                captures_tried.push((mv, v));
+                self.tried_captures[ply][n_captures] = (mv, v);
+                n_captures += 1;
             }
         }
 
@@ -1019,7 +1053,7 @@ impl Searcher {
         }
 
         let mut list = MoveList::new();
-        gen_moves(board, &mut list, !in_check);
+        gen_moves(board, &mut list, !in_check, None);
         if in_check && list.len == 0 {
             return -MATE + ply as i32;
         }
