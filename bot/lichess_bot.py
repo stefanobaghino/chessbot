@@ -25,8 +25,13 @@ DOTENV_PATH (default: <repo>/.env) without overriding variables already set:
   IDLE_RATING_RANGE  max rating distance of an opponent (default 500)
   IDLE_MIN_GAMES  minimum blitz games an opponent must have (default 50)
   IDLE_ACCEPT_TIMEOUT  seconds to wait for an opponent before cancelling (default 20)
-  IDLE_PAUSE_FILE  while this file exists, no idle challenges are made (default:
-                 unset); SIGUSR1 toggles idle challenging at runtime as well
+  IDLE_PAUSE_FILE  while this file exists, no idle challenges are made and incoming
+                 challenges are declined (default: unset); SIGUSR1 toggles idle
+                 challenging at runtime as well
+  BOOK            1 to play the first moves from the Lichess masters opening explorer
+                 instead of searching (default 1); 0 disables the book
+  BOOK_PLIES      plies after which the book is no longer consulted (default 16)
+  BOOK_MIN_GAMES  minimum master games a book move needs (default 50)
 SIGHUP re-reads every IDLE_* setting except IDLE_CHALLENGE from the .env file and the
 environment (the file wins) on the running process, so ops can retune idle games
 without a restart; the new values are logged, a bad value keeps the old ones.
@@ -55,6 +60,7 @@ import threading
 import time
 from collections.abc import Mapping
 from pathlib import Path
+from typing import ClassVar
 
 import berserk
 import chess
@@ -104,6 +110,9 @@ class Config:
         self.login_timeout = float(os.environ.get("LOGIN_TIMEOUT", "300"))
         self.heartbeat_interval = float(os.environ.get("HEARTBEAT_INTERVAL", "300"))
         self.idle_challenge = os.environ.get("IDLE_CHALLENGE", "0") == "1"
+        self.book = os.environ.get("BOOK", "1") == "1"
+        self.book_plies = int(os.environ.get("BOOK_PLIES", "16"))
+        self.book_min_games = int(os.environ.get("BOOK_MIN_GAMES", "50"))
         self.read_idle(os.environ)
 
     IDLE_KEYS = ("IDLE_CLOCK", "IDLE_RATED", "IDLE_MAX_PER_DAY", "IDLE_GAP_SECONDS", "IDLE_TICK",
@@ -179,6 +188,64 @@ def watchdog_period() -> float | None:
     return max(1.0, int(usec) / 1_000_000 / 3)
 
 
+class Book:
+    """Opening moves from the Lichess masters explorer: among the moves played in at
+    least `min_games` master games that score at least 40% for our side, one is drawn
+    with probability proportional to its game count. Anything failing (network, rate
+    limit, position not in the database) hands the move back to the engine."""
+
+    URL = "https://explorer.lichess.ovh/masters"
+    cache: ClassVar[dict[str, list[dict]]] = {}  # epd -> explorer moves, shared by all games
+    disabled_until: ClassVar[float] = 0.0  # after a 429, monotonic time before which the book stays quiet
+
+    def __init__(self, token: str, plies: int = 16, min_games: int = 50, fetch=None) -> None:
+        self.token = token
+        self.plies = plies
+        self.min_games = min_games
+        self.fetch = fetch or self.fetch_explorer
+        self.out = False  # left the book in this game: stop asking
+
+    def fetch_explorer(self, fen: str) -> list[dict]:
+        r = requests.get(self.URL, params={"fen": fen, "moves": 12, "topGames": 0},
+                         headers={"Authorization": f"Bearer {self.token}"}, timeout=3)
+        if r.status_code == 429:
+            Book.disabled_until = time.monotonic() + 600
+            log.warning("book: rate limited by the explorer, off for 10 min")
+            return []
+        r.raise_for_status()
+        return r.json().get("moves", [])
+
+    def move(self, board: chess.Board) -> chess.Move | None:
+        if self.out or len(board.move_stack) >= self.plies or time.monotonic() < Book.disabled_until:
+            return None
+        key = board.epd()
+        moves = Book.cache.get(key)
+        if moves is None:
+            try:
+                moves = self.fetch(board.fen())
+            except Exception as e:  # noqa: BLE001
+                log.warning("book: lookup failed (%s: %s), using the engine", type(e).__name__, e)
+                self.out = True
+                return None
+            Book.cache[key] = moves
+        candidates = []
+        for m in moves:
+            total = m.get("white", 0) + m.get("draws", 0) + m.get("black", 0)
+            if total < self.min_games:
+                continue
+            ours = m.get("white", 0) if board.turn == chess.WHITE else m.get("black", 0)
+            if (ours + 0.5 * m.get("draws", 0)) / total < 0.4:
+                continue
+            try:
+                candidates.append((board.parse_uci(m["uci"]), total))
+            except (KeyError, ValueError):
+                continue
+        if not candidates:
+            self.out = True
+            return None
+        return random.choices([c[0] for c in candidates], weights=[c[1] for c in candidates])[0]
+
+
 class Game(threading.Thread):
     def __init__(self, client: berserk.Client, game_id: str, my_id: str, cfg: Config, on_done) -> None:
         super().__init__(daemon=True, name=f"game-{game_id}")
@@ -188,6 +255,7 @@ class Game(threading.Thread):
         self.cfg = cfg
         self.on_done = on_done
         self.clock: tuple[int, int] | None = None  # (seconds, increment) once gameFull arrived
+        self.book = Book(cfg.token, cfg.book_plies, cfg.book_min_games) if cfg.book else None
 
     def run(self) -> None:
         outcome = "finished"
@@ -289,6 +357,12 @@ class Game(threading.Thread):
         btime = self.ms(state.get("btime"))
         winc = self.ms(state.get("winc"))
         binc = self.ms(state.get("binc"))
+        if self.book is not None:
+            book_move = self.book.move(board)
+            if book_move is not None:
+                log.info("game %s: book move %s", self.game_id, book_move.uci())
+                self.send_move(book_move.uci())
+                return engine
         limit = chess.engine.Limit(white_clock=wtime / 1000, black_clock=btime / 1000,
                                    white_inc=winc / 1000, black_inc=binc / 1000)
         # First move: play fast, clocks are not running yet.
@@ -522,7 +596,8 @@ class Bot:
         self.exit(0)
 
     def should_accept(self, challenge: dict) -> str | None:
-        if self.draining.is_set():
+        if self.draining.is_set() or self.idle_pause_reason():
+            # Paused (smoke test or maintenance, #22): nothing may take the game slot.
             return "later"
         if challenge.get("challenger", {}).get("title") == "BOT" and self.games_last_24h() >= self.cfg.idle_max_per_day:
             return "later"

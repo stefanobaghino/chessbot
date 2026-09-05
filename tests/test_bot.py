@@ -41,7 +41,9 @@ def make_bot(timeout=30.0):
     b.signals_received = 0
     b.exits = []
     b.exit = b.exits.append
-    b.cfg = type("Cfg", (), {"shutdown_timeout": timeout, "max_games": 1})()
+    b.idle_paused = False
+    b.idle_pause_logged = None
+    b.cfg = type("Cfg", (), {"shutdown_timeout": timeout, "max_games": 1, "idle_pause_file": None, "book": False})()
     return b
 
 
@@ -127,6 +129,7 @@ def test_engine_is_respawned_mid_game():
 
     g = Game.__new__(Game)
     g.game_id = "g1"
+    g.book = None
     g.client = type("Client", (), {})()
     g.client.bots = FakeBots()
     g.client.bots.make_move = lambda gid, uci: None
@@ -336,6 +339,7 @@ def make_game():
     g = Game.__new__(Game)
     g.game_id = "g1"
     g.my_id = "me"
+    g.book = None
     g.client = type("Client", (), {})()
     g.client.bots = FakeBots()
     return g
@@ -640,3 +644,84 @@ def test_game_reads_the_clock_from_gamefull():
     g.board_from = lambda first: __import__("chess").Board()
     g.play_stream(None)
     assert g.clock == (120, 1)
+
+
+def test_incoming_challenges_declined_while_paused(tmp_path):
+    b = idle_bot()
+    ch = {"id": "c", "challenger": {"id": "x"}, "variant": {"key": "standard"}, "speed": "blitz"}
+    assert b.should_accept(ch) is None
+    b.idle_paused = True
+    assert b.should_accept(ch) == "later"
+    b.idle_paused = False
+    pause = tmp_path / "pause"
+    pause.touch()
+    b.cfg.idle_pause_file = str(pause)
+    assert b.should_accept(ch) == "later"
+    pause.unlink()
+    assert b.should_accept(ch) is None
+
+
+def explorer(*rows):
+    return [{"uci": u, "white": w, "draws": d, "black": bl} for u, w, d, bl in rows]
+
+
+def test_book_picks_well_tried_moves_and_falls_back():
+    from bot.lichess_bot import Book
+
+    Book.cache.clear()
+    Book.disabled_until = 0.0
+    import chess
+
+    calls = []
+
+    def fetch(fen):
+        calls.append(fen)
+        if fen.split()[1] == "b":
+            return explorer(("e7e5", 300, 300, 300), ("c7c5", 300, 300, 300))
+        return explorer(("e2e4", 400, 300, 300), ("d2d4", 300, 300, 300), ("h2h4", 30, 10, 60), ("a2a3", 10, 100, 500))
+
+    book = Book("tok", plies=4, min_games=50, fetch=fetch)
+    board = chess.Board()
+    picks = {book.move(board).uci() for _ in range(50)}
+    assert picks == {"e2e4", "d2d4"}  # h4 too rare, a3 scores under 40% for white
+    assert len(calls) == 1  # cached
+    board.push_uci("e2e4")
+    assert book.move(board).uci() in {"e7e5", "c7c5"}
+    assert len(calls) == 2
+    # Beyond BOOK_PLIES the book is silent.
+    for uci in ("e7e5", "g1f3", "b8c6"):
+        board.push_uci(uci)
+    assert book.move(board) is None
+    # Out of the database: engine takes over for the rest of the game.
+    Book.cache.clear()
+    empty = Book("tok", plies=40, min_games=50, fetch=lambda fen: [])
+    b2 = chess.Board()
+    assert empty.move(b2) is None
+    b2.push_uci("e2e4")
+    assert empty.move(b2) is None and empty.out
+    # Errors do not propagate.
+    def boom(fen):
+        raise OSError("down")
+    Book.cache.clear()
+    broken = Book("tok", fetch=boom)
+    assert broken.move(chess.Board()) is None and broken.out
+    # A rate limit silences every book for a while.
+    Book.cache.clear()
+    Book.disabled_until = time.monotonic() + 100
+    assert Book("tok", fetch=fetch).move(chess.Board()) is None
+    Book.disabled_until = 0.0
+
+
+def test_book_scores_for_black():
+    from bot.lichess_bot import Book
+
+    Book.cache.clear()
+    import chess
+
+    board = chess.Board()
+    board.push_uci("e2e4")
+    def fetch(fen):
+        return explorer(("e7e5", 600, 200, 200), ("c7c5", 300, 300, 400))
+
+    picks = {Book("tok", fetch=fetch).move(board).uci() for _ in range(40)}
+    assert picks == {"c7c5"}  # e5 scores only 30% for black here
