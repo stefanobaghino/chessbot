@@ -6,6 +6,10 @@ DOTENV_PATH (default: <repo>/.env) without overriding variables already set:
   ENGINE_PATH    path to the UCI engine binary (default: engine/target/release/chessbot-engine)
   ENGINE_HASH    hash size in MB (default 128)
   ENGINE_THREADS search threads passed as the Threads UCI option (default 1)
+  CONTEMPT_PER_100  centipawns of draw aversion per 100 rating points the bot is above
+                 the opponent (default 10); negative below, so the engine seeks draws
+                 against stronger opponents. 0 disables contempt
+  CONTEMPT_MAX   cap on the contempt in centipawns (default 30)
   PONDER         1 to keep searching the expected reply on the opponent's time
                  (default 1); costs a core for the whole game, 0 disables it
   MAX_GAMES      concurrent games to accept (default 1)
@@ -110,6 +114,8 @@ class Config:
         self.engine_hash = int(os.environ.get("ENGINE_HASH", "128"))
         self.engine_threads = int(os.environ.get("ENGINE_THREADS", "1"))
         self.ponder = os.environ.get("PONDER", "1") == "1"
+        self.contempt_per_100 = float(os.environ.get("CONTEMPT_PER_100", "10"))
+        self.contempt_max = int(os.environ.get("CONTEMPT_MAX", "30"))
         self.max_games = int(os.environ.get("MAX_GAMES", "1"))
         self.shutdown_timeout = float(os.environ.get("SHUTDOWN_TIMEOUT", "900"))
         self.stream_read_timeout = float(os.environ.get("STREAM_READ_TIMEOUT", "90"))
@@ -319,6 +325,7 @@ class Game(threading.Thread):
         self.clock: tuple[int, int] | None = None  # (seconds, increment) once gameFull arrived
         self.book = Book(cfg.token, cfg.book_plies, cfg.book_min_games) if cfg.book else None
         self.tablebase = Tablebase() if cfg.tablebase else None
+        self.contempt: int | None = None  # set from the ratings in gameFull, kept across engine respawns
 
     def run(self) -> None:
         outcome = "finished"
@@ -334,8 +341,19 @@ class Game(threading.Thread):
         # Own process group: a signal sent to the bot's group (or cgroup by a service
         # manager configured that way) must not kill the engine mid-search.
         engine = chess.engine.SimpleEngine.popen_uci(self.cfg.engine_path, setpgrp=True)
-        engine.configure({"Hash": self.cfg.engine_hash, "Threads": self.cfg.engine_threads})
+        options = {"Hash": self.cfg.engine_hash, "Threads": self.cfg.engine_threads}
+        if self.contempt is not None:
+            options["Contempt"] = self.contempt
+        engine.configure(options)
         return engine
+
+    def contempt_for(self, mine: int | None, theirs: int | None) -> int:
+        """Draw aversion in centipawns from the rating difference (#24): a draw is worth
+        less than the expected score against a weaker opponent, more against a stronger one."""
+        if mine is None or theirs is None or self.cfg.contempt_per_100 == 0:
+            return 0
+        raw = round((mine - theirs) * self.cfg.contempt_per_100 / 100)
+        return max(-self.cfg.contempt_max, min(self.cfg.contempt_max, raw))
 
     @staticmethod
     def quit_engine(engine: chess.engine.SimpleEngine | None) -> None:
@@ -381,6 +399,12 @@ class Game(threading.Thread):
         my_color = chess.WHITE if first["white"].get("id") == self.my_id else chess.BLACK
         opponent = (first["black"] if my_color else first["white"]).get("name", "?")
         log.info("game %s: playing %s vs %s", self.game_id, "white" if my_color else "black", opponent)
+        if self.contempt is None:
+            me, them = (first["white"], first["black"]) if my_color else (first["black"], first["white"])
+            self.contempt = self.contempt_for(me.get("rating"), them.get("rating"))
+            if self.contempt:
+                log.info("game %s: contempt %d (%s vs %s)", self.game_id, self.contempt, me.get("rating"), them.get("rating"))
+                engine.configure({"Contempt": self.contempt})
         self.apply_state(board, first["state"])
         if first["state"].get("status", "started") != "started":
             log.info("game %s: already over (%s)", self.game_id, first["state"].get("status"))

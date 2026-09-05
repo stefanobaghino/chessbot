@@ -114,6 +114,10 @@ class LiveEngine:
     def __init__(self):
         self.played = 0
         self.calls = []
+        self.options = {}
+
+    def configure(self, opts):
+        self.options.update(opts)
 
     def play(self, board, limit, **kwargs):
         import chess
@@ -369,6 +373,7 @@ def make_game():
     g.my_id = "me"
     g.book = None
     g.tablebase = None
+    g.contempt = None
     g.client = type("Client", (), {})()
     g.client.bots = FakeBots()
     return g
@@ -536,8 +541,44 @@ def test_engine_threads_option_is_configured(monkeypatch):
     monkeypatch.setattr(chess.engine.SimpleEngine, "popen_uci", staticmethod(lambda path, setpgrp=False: FakeEngine()))
     g = make_game()
     g.cfg = type("Cfg", (), {"engine_path": "x", "engine_hash": 64, "engine_threads": 3})()
+    g.contempt = None
     g.new_engine()
     assert configured == {"Hash": 64, "Threads": 3}
+    g.contempt = -12  # a respawned engine gets the game's contempt back
+    g.new_engine()
+    assert configured["Contempt"] == -12
+
+
+def test_contempt_follows_the_rating_difference():
+    g = make_game()
+    g.cfg = type("Cfg", (), {"contempt_per_100": 10.0, "contempt_max": 30})()
+    assert g.contempt_for(2560, 2360) == 20
+    assert g.contempt_for(2560, 2900) == -30  # capped
+    assert g.contempt_for(2560, 2555) == 0  # rounds away
+    assert g.contempt_for(None, 2500) == 0 and g.contempt_for(2500, None) == 0
+    g.cfg.contempt_per_100 = 0
+    assert g.contempt_for(2560, 2000) == 0
+
+
+def test_play_stream_configures_contempt_from_gamefull_ratings():
+    g = make_game()
+    g.cfg = type("Cfg", (), {"contempt_per_100": 10.0, "contempt_max": 30, "ponder": False, "tablebase": False})()
+    g.contempt = None
+    engine = LiveEngine()
+    g.quit_engine = lambda e: None
+    g.new_engine = lambda: engine
+
+    class Bots(FakeBots):
+        def stream_game_state(self, gid):
+            yield {"type": "gameFull", "white": {"id": "me", "rating": 2600}, "black": {"id": "opp", "name": "opp", "rating": 2450},
+                   "state": {"moves": "", "status": "mate"}}
+
+        def make_move(self, gid, uci):
+            pass
+
+    g.client.bots = Bots()
+    g.play_stream(engine)
+    assert g.contempt == 15 and engine.options == {"Contempt": 15}
 
 
 def test_sighup_reloads_idle_settings_from_dotenv(tmp_path, monkeypatch):
@@ -660,6 +701,7 @@ def test_game_reads_the_clock_from_gamefull():
     g.my_id = "me"
     g.game_id = "g"
     g.clock = None
+    g.contempt = 0
     calls = []
 
     class Bots:

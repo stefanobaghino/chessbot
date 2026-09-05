@@ -29,6 +29,7 @@ enum Cmd {
     Go(Limits),
     SetHash(usize),
     SetThreads(usize),
+    SetContempt(i32),
     UseNnue(bool),
     Bench(i32),
     Eval,
@@ -130,7 +131,10 @@ fn search_thread(rx: mpsc::Receiver<Cmd>, stop: Arc<AtomicBool>, ponder: Arc<Ato
                 }
                 searcher.tt = tt.clone();
                 for i in 0..n {
-                    helpers.push(Searcher::new(tt.clone(), stop.clone(), shared_nodes.clone(), i + 1));
+                    let mut h = Searcher::new(tt.clone(), stop.clone(), shared_nodes.clone(), i + 1);
+                    h.use_nnue = searcher.use_nnue;
+                    h.contempt = searcher.contempt;
+                    helpers.push(h);
                 }
             }
             Cmd::SetThreads(n) => {
@@ -138,7 +142,14 @@ fn search_thread(rx: mpsc::Receiver<Cmd>, stop: Arc<AtomicBool>, ponder: Arc<Ato
                 for i in 1..n {
                     let mut h = Searcher::new(tt.clone(), stop.clone(), shared_nodes.clone(), i);
                     h.use_nnue = searcher.use_nnue;
+                    h.contempt = searcher.contempt;
                     helpers.push(h);
+                }
+            }
+            Cmd::SetContempt(c) => {
+                searcher.contempt = c;
+                for h in helpers.iter_mut() {
+                    h.contempt = c;
                 }
             }
             Cmd::UseNnue(v) => {
@@ -253,6 +264,7 @@ fn main() {
                 println!("option name Threads type spin default 1 min 1 max 8");
                 println!("option name UseNNUE type check default true");
                 println!("option name Ponder type check default false");
+                println!("option name Contempt type spin default 0 min -100 max 100");
                 println!("uciok");
             }
             "isready" => println!("readyok"),
@@ -272,6 +284,11 @@ fn main() {
                     if name.eq_ignore_ascii_case("Threads") {
                         if let Ok(n) = value.parse::<usize>() {
                             tx.send(Cmd::SetThreads(n.clamp(1, 8))).ok();
+                        }
+                    }
+                    if name.eq_ignore_ascii_case("Contempt") {
+                        if let Ok(c) = value.parse::<i32>() {
+                            tx.send(Cmd::SetContempt(c.clamp(-100, 100))).ok();
                         }
                     }
                     if name.eq_ignore_ascii_case("Hash") {

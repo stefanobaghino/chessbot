@@ -81,6 +81,9 @@ pub struct Searcher {
     pub ponder_flag: Arc<AtomicBool>,
     /// This search started as a ponder and has not received `ponderhit` yet.
     pondering: bool,
+    /// Centipawns a draw costs the root side (UCI `Contempt`): positive avoids draws,
+    /// negative seeks them. Tapers to zero as material comes off, see `draw_score`.
+    pub contempt: i32,
     /// Time limits to apply on `ponderhit`, from the clocks of the `go ponder` command.
     ponder_limits: (Option<Duration>, Option<Duration>),
     killers: [[Option<Move>; 2]; MAX_PLY],
@@ -263,6 +266,7 @@ impl Searcher {
             ponder_flag: Arc::new(AtomicBool::new(false)),
             pondering: false,
             ponder_limits: (None, None),
+            contempt: 0,
             killers: [[None; 2]; MAX_PLY],
             history: [[[0; 64]; 64]; 2],
             cont_hist: vec![0; CONT_TABLES * PIECE_TO * PIECE_TO],
@@ -540,6 +544,18 @@ impl Searcher {
         Some(best_move)
     }
 
+    /// Score of a draw at `ply`, from the side to move: the root side gives up `contempt`
+    /// scaled by the material left (full at 32 pieces, nothing at 7, where tablebases
+    /// know the truth), the opponent gains it.
+    fn draw_score(&self, board: &Board, ply: usize) -> i32 {
+        if self.contempt == 0 {
+            return 0;
+        }
+        let pieces = board.occupied().len() as i32;
+        let c = self.contempt * (pieces - 7).clamp(0, 25) / 25;
+        if ply % 2 == 0 { -c } else { c }
+    }
+
     /// The reply the search expects after `best`, for `bestmove ... ponder`.
     pub fn ponder_move(&self, board: &Board, best: Move) -> Option<Move> {
         let mut b = board.clone();
@@ -701,7 +717,7 @@ impl Searcher {
         let root = ply == 0;
         if !root {
             if board.halfmove_clock() >= 100 || is_insufficient(board) || self.is_repetition(board.hash(), board.halfmove_clock()) {
-                return 0;
+                return self.draw_score(board, ply);
             }
             alpha = alpha.max(-MATE + ply as i32);
             beta = beta.min(MATE - ply as i32 - 1);
@@ -1103,6 +1119,25 @@ mod tests {
         // 300 ms of pondering plus a timed search on a 600 ms clock: well under two seconds,
         // and clearly longer than the 300 ms wait alone.
         assert!(elapsed > Duration::from_millis(300) && elapsed < Duration::from_millis(2000), "{:?}", elapsed);
+    }
+
+    #[test]
+    fn draw_score_follows_contempt_side_and_material() {
+        let mut s = searcher();
+        assert_eq!(s.draw_score(&Board::default(), 0), 0);
+        s.contempt = 20;
+        // 32 pieces: full contempt; the root side (even plies) dislikes the draw, the opponent likes it.
+        assert_eq!(s.draw_score(&Board::default(), 0), -20);
+        assert_eq!(s.draw_score(&Board::default(), 3), 20);
+        // 16 pieces: (16 - 7) / 25 of it.
+        let mid = Board::from_fen("r3k2r/pp3ppp/8/8/8/8/PP3PPP/R3K2R w KQkq - 0 1", false).unwrap();
+        assert_eq!(mid.occupied().len(), 16);
+        assert_eq!(s.draw_score(&mid, 0), -7);
+        // Seven pieces or fewer: plain draw.
+        let ending = Board::from_fen("8/8/8/3k4/8/8/3PK3/8 w - - 0 1", false).unwrap();
+        assert_eq!(s.draw_score(&ending, 0), 0);
+        s.contempt = -20;
+        assert_eq!(s.draw_score(&Board::default(), 0), 20);
     }
 
     #[test]
