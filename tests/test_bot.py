@@ -43,7 +43,7 @@ def make_bot(timeout=30.0):
     b.exit = b.exits.append
     b.idle_paused = False
     b.idle_pause_logged = None
-    b.cfg = type("Cfg", (), {"shutdown_timeout": timeout, "max_games": 1, "idle_pause_file": None, "book": False})()
+    b.cfg = type("Cfg", (), {"shutdown_timeout": timeout, "max_games": 1, "idle_pause_file": None, "book": False, "tablebase": False})()
     return b
 
 
@@ -132,6 +132,7 @@ def test_engine_is_respawned_mid_game():
     g = Game.__new__(Game)
     g.game_id = "g1"
     g.book = None
+    g.tablebase = None
     g.client = type("Client", (), {})()
     g.client.bots = FakeBots()
     g.client.bots.make_move = lambda gid, uci: None
@@ -150,6 +151,7 @@ def test_maybe_move_ponders_after_the_first_move():
     g = Game.__new__(Game)
     g.game_id = "g1"
     g.book = None
+    g.tablebase = None
     g.client = type("Client", (), {})()
     g.client.bots = FakeBots()
     g.client.bots.make_move = lambda gid, uci: None
@@ -366,6 +368,7 @@ def make_game():
     g.game_id = "g1"
     g.my_id = "me"
     g.book = None
+    g.tablebase = None
     g.client = type("Client", (), {})()
     g.client.bots = FakeBots()
     return g
@@ -434,7 +437,7 @@ def test_play_reconnects_stream_after_transport_error(monkeypatch):
 
     monkeypatch.setattr(time, "sleep", lambda s: None)
     g = make_game()
-    g.cfg = type("Cfg", (), {"engine_path": "x", "engine_hash": 16, "ponder": True})()
+    g.cfg = type("Cfg", (), {"engine_path": "x", "engine_hash": 16, "ponder": True, "tablebase": False})()
     g.new_engine = lambda: LiveEngine()
     g.quit_engine = lambda e: None
     opened = []
@@ -751,3 +754,98 @@ def test_book_scores_for_black():
 
     picks = {Book("tok", fetch=fetch).move(board).uci() for _ in range(40)}
     assert picks == {"c7c5"}  # e5 scores only 30% for black here
+
+
+def tb_data(category, *moves):
+    return {"category": category, "dtz": 3, "moves": [{"uci": u, "category": c} for u, c in moves]}
+
+
+def tb_game(fetch, engine_move):
+    import chess
+
+    g = Game.__new__(Game)
+    g.game_id = "g1"
+    g.book = None
+    g.tablebase = None
+    g.cfg = type("Cfg", (), {"ponder": False})()
+    g.client = type("Client", (), {})()
+    g.client.bots = FakeBots()
+    sent = []
+    g.client.bots.make_move = lambda gid, uci: sent.append(uci)
+    from bot.lichess_bot import Tablebase
+
+    g.tablebase = Tablebase(fetch=fetch)
+
+    class Engine:
+        def __init__(self):
+            self.played = 0
+
+        def play(self, board, limit, **kwargs):
+            self.played += 1
+            return chess.engine.PlayResult(chess.Move.from_uci(engine_move), None)
+
+    return g, sent, Engine()
+
+
+def test_tablebase_converts_wins_without_the_engine():
+    import chess
+
+    from bot.lichess_bot import Tablebase
+
+    Tablebase.disabled_until = 0.0
+    board = chess.Board("8/8/8/8/8/4k3/4p3/4K3 b - - 0 1")
+    calls = []
+
+    def fetch(fen):
+        calls.append(fen)
+        return tb_data("win", ("e3d3", "loss"), ("e3d4", "draw"))
+
+    g, sent, engine = tb_game(fetch, "e3d4")
+    g.maybe_move(engine, board, chess.BLACK, {"wtime": 60000, "btime": 60000})
+    assert sent == ["e3d3"] and engine.played == 0 and calls == [board.fen()]
+    # Lost: the tablebase's first move (longest resistance) is played too.
+    g, sent, engine = tb_game(lambda fen: tb_data("loss", ("e1f2", "win")), "e1f2")
+    g.maybe_move(engine, chess.Board("8/8/8/8/8/3k4/4p3/4K3 w - - 0 1"), chess.WHITE, {"wtime": 60000, "btime": 60000})
+    assert sent == ["e1f2"] and engine.played == 0
+
+
+def test_tablebase_lets_the_engine_play_draws_but_not_lose_them():
+    import chess
+
+    board = chess.Board("8/8/8/8/3k4/8/3P4/3K4 w - - 0 1")
+    data = tb_data("draw", ("d2d3", "draw"), ("d1c1", "draw"), ("d1e2", "win"))
+    g, sent, engine = tb_game(lambda fen: data, "d1c1")
+    g.maybe_move(engine, board, chess.WHITE, {"wtime": 60000, "btime": 60000})
+    assert sent == ["d1c1"] and engine.played == 1
+    g, sent, engine = tb_game(lambda fen: data, "d1e2")
+    g.maybe_move(engine, board, chess.WHITE, {"wtime": 60000, "btime": 60000})
+    assert sent == ["d2d3"] and engine.played == 1
+
+
+def test_tablebase_is_skipped_when_it_does_not_apply():
+    import chess
+
+    calls = []
+
+    def fetch(fen):
+        calls.append(fen)
+        return tb_data("win", ("e2e4", "loss"))
+
+    g, sent, engine = tb_game(fetch, "e2e4")
+    g.maybe_move(engine, chess.Board(), chess.WHITE, {"wtime": 60000, "btime": 60000})  # 32 pieces
+    g.maybe_move(engine, chess.Board("4k3/8/8/8/8/8/8/4K2R w K - 0 1"), chess.WHITE, {"wtime": 60000, "btime": 60000})  # castling
+    assert calls == [] and engine.played == 2
+
+    def boom(fen):
+        raise OSError("down")
+
+    g, sent, engine = tb_game(boom, "e1f2")
+    g.maybe_move(engine, chess.Board("8/8/8/8/8/3k4/4p3/4K3 w - - 0 1"), chess.WHITE, {"wtime": 60000, "btime": 60000})
+    assert sent == ["e1f2"] and engine.played == 1
+    from bot.lichess_bot import Tablebase
+
+    Tablebase.disabled_until = time.monotonic() + 100
+    g, sent, engine = tb_game(fetch, "e1f2")
+    g.maybe_move(engine, chess.Board("8/8/8/8/8/3k4/4p3/4K3 w - - 0 1"), chess.WHITE, {"wtime": 60000, "btime": 60000})
+    assert calls == [] and engine.played == 1
+    Tablebase.disabled_until = 0.0

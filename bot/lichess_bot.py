@@ -34,6 +34,9 @@ DOTENV_PATH (default: <repo>/.env) without overriding variables already set:
                  instead of searching (default 1); 0 disables the book
   BOOK_PLIES      plies after which the book is no longer consulted (default 16)
   BOOK_MIN_GAMES  minimum master games a book move needs (default 50)
+  TABLEBASE       1 to play 7-piece endgames from the Lichess tablebase (default 1):
+                 won and lost positions take the tablebase's best move, in drawn ones
+                 the engine's move is played unless it throws the draw away
 SIGHUP re-reads every IDLE_* setting except IDLE_CHALLENGE from the .env file and the
 environment (the file wins) on the running process, so ops can retune idle games
 without a restart; the new values are logged, a bad value keeps the old ones.
@@ -116,6 +119,7 @@ class Config:
         self.book = os.environ.get("BOOK", "1") == "1"
         self.book_plies = int(os.environ.get("BOOK_PLIES", "16"))
         self.book_min_games = int(os.environ.get("BOOK_MIN_GAMES", "50"))
+        self.tablebase = os.environ.get("TABLEBASE", "1") == "1"
         self.read_idle(os.environ)
 
     IDLE_KEYS = ("IDLE_CLOCK", "IDLE_RATED", "IDLE_MAX_PER_DAY", "IDLE_GAP_SECONDS", "IDLE_TICK",
@@ -249,6 +253,61 @@ class Book:
         return random.choices([c[0] for c in candidates], weights=[c[1] for c in candidates])[0]
 
 
+class Tablebase:
+    """Endgame moves from the Lichess 7-piece tablebase (tablebase.lichess.ovh). The
+    response carries the root category and the legal moves sorted best-first, each
+    with its category from the opponent's point of view."""
+
+    URL = "https://tablebase.lichess.ovh/standard"
+    MAX_PIECES = 7
+    DECISIVE = ("win", "cursed-win", "maybe-win", "loss", "blessed-loss", "maybe-loss")
+    disabled_until: ClassVar[float] = 0.0
+
+    def __init__(self, fetch=None) -> None:
+        self.fetch = fetch or self.fetch_lichess
+
+    @staticmethod
+    def fetch_lichess(fen: str) -> dict:
+        r = requests.get(Tablebase.URL, params={"fen": fen}, timeout=2)
+        if r.status_code == 429:
+            Tablebase.disabled_until = time.monotonic() + 600
+            log.warning("tablebase: rate limited, off for 10 min")
+            return {}
+        r.raise_for_status()
+        return r.json()
+
+    @staticmethod
+    def applies(board: chess.Board) -> bool:
+        return (len(board.piece_map()) <= Tablebase.MAX_PIECES
+                and not board.has_castling_rights(chess.WHITE) and not board.has_castling_rights(chess.BLACK))
+
+    def lookup(self, board: chess.Board) -> dict | None:
+        """The tablebase entry for the position, None when unavailable."""
+        if not self.applies(board) or time.monotonic() < Tablebase.disabled_until:
+            return None
+        try:
+            data = self.fetch(board.fen())
+        except Exception as e:  # noqa: BLE001
+            log.warning("tablebase: lookup failed (%s: %s), using the engine", type(e).__name__, e)
+            return None
+        return data if data.get("category") and data.get("moves") else None
+
+    @staticmethod
+    def best_move(board: chess.Board, data: dict) -> chess.Move | None:
+        for m in data.get("moves", []):
+            try:
+                mv = board.parse_uci(m["uci"])
+            except (KeyError, ValueError):
+                continue
+            return mv
+        return None
+
+    @staticmethod
+    def keeps_draw(data: dict, move: chess.Move) -> bool:
+        """True if `move` keeps a drawn position drawn (its category, seen from the opponent, is a draw)."""
+        return any(m.get("uci") == move.uci() and m.get("category") == "draw" for m in data.get("moves", []))
+
+
 class Game(threading.Thread):
     def __init__(self, client: berserk.Client, game_id: str, my_id: str, cfg: Config, on_done) -> None:
         super().__init__(daemon=True, name=f"game-{game_id}")
@@ -259,6 +318,7 @@ class Game(threading.Thread):
         self.on_done = on_done
         self.clock: tuple[int, int] | None = None  # (seconds, increment) once gameFull arrived
         self.book = Book(cfg.token, cfg.book_plies, cfg.book_min_games) if cfg.book else None
+        self.tablebase = Tablebase() if cfg.tablebase else None
 
     def run(self) -> None:
         outcome = "finished"
@@ -366,6 +426,15 @@ class Game(threading.Thread):
                 log.info("game %s: book move %s", self.game_id, book_move.uci())
                 self.send_move(book_move.uci())
                 return engine
+        tb = self.tablebase.lookup(board) if self.tablebase is not None else None
+        if tb and tb["category"] in Tablebase.DECISIVE:
+            # Won: the tablebase converts (shortest DTZ, resets the 50-move counter when it
+            # can); lost: it resists longest. Either way the engine has nothing to add.
+            tb_move = Tablebase.best_move(board, tb)
+            if tb_move is not None:
+                log.info("game %s: tablebase move %s (%s, dtz %s)", self.game_id, tb_move.uci(), tb["category"], tb.get("dtz"))
+                self.send_move(tb_move.uci())
+                return engine
         limit = chess.engine.Limit(white_clock=wtime / 1000, black_clock=btime / 1000,
                                    white_inc=winc / 1000, black_inc=binc / 1000)
         # First move: play fast, clocks are not running yet. No pondering from a fixed-time
@@ -387,7 +456,14 @@ class Game(threading.Thread):
                 engine = self.new_engine()
         if result is None or result.move is None:
             return engine
-        self.send_move(result.move.uci())
+        move = result.move
+        if tb and tb["category"] == "draw" and not Tablebase.keeps_draw(tb, move):
+            # Drawn position: the engine keeps playing for a swindle, but never a losing move.
+            tb_move = Tablebase.best_move(board, tb)
+            if tb_move is not None:
+                log.info("game %s: tablebase move %s instead of %s, which loses", self.game_id, tb_move.uci(), move.uci())
+                move = tb_move
+        self.send_move(move.uci())
         return engine
 
     def send_move(self, uci: str) -> None:
