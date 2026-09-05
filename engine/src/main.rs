@@ -85,6 +85,11 @@ fn parse_go(tokens: &[&str]) -> Limits {
                 i += 1;
                 continue;
             }
+            "ponder" => {
+                l.ponder = true;
+                i += 1;
+                continue;
+            }
             _ => {
                 i += 1;
                 continue;
@@ -95,10 +100,11 @@ fn parse_go(tokens: &[&str]) -> Limits {
     l
 }
 
-fn search_thread(rx: mpsc::Receiver<Cmd>, stop: Arc<AtomicBool>) {
+fn search_thread(rx: mpsc::Receiver<Cmd>, stop: Arc<AtomicBool>, ponder: Arc<AtomicBool>) {
     let mut tt = Arc::new(TranspositionTable::new(DEFAULT_HASH_MB));
     let shared_nodes = Arc::new(AtomicU64::new(0));
     let mut searcher = Searcher::new(tt.clone(), stop.clone(), shared_nodes.clone(), 0);
+    searcher.ponder_flag = ponder.clone();
     let mut helpers: Vec<Searcher> = Vec::new();
     let mut board = Board::startpos();
     let mut history: Vec<u64> = Vec::new();
@@ -157,7 +163,14 @@ fn search_thread(rx: mpsc::Receiver<Cmd>, stop: Arc<AtomicBool>) {
                     best
                 });
                 match best {
-                    Some(m) => println!("bestmove {}", display_uci_move(&board, m)),
+                    Some(m) => match searcher.ponder_move(&board, m) {
+                        Some(p) => {
+                            let mut after = board.clone();
+                            after.play_unchecked(m);
+                            println!("bestmove {} ponder {}", display_uci_move(&board, m), display_uci_move(&after, p));
+                        }
+                        None => println!("bestmove {}", display_uci_move(&board, m)),
+                    },
                     None => println!("bestmove 0000"),
                 }
                 io::stdout().flush().ok();
@@ -201,12 +214,14 @@ fn main() {
         libc::signal(libc::SIGPIPE, libc::SIG_DFL);
     }
     let stop = Arc::new(AtomicBool::new(false));
+    let ponder = Arc::new(AtomicBool::new(false));
     let (tx, rx) = mpsc::channel::<Cmd>();
     let worker = {
         let stop = stop.clone();
+        let ponder = ponder.clone();
         thread::Builder::new()
             .stack_size(64 * 1024 * 1024)
-            .spawn(move || search_thread(rx, stop))
+            .spawn(move || search_thread(rx, stop, ponder))
             .expect("spawn search thread")
     };
 
@@ -237,6 +252,7 @@ fn main() {
                 println!("option name Hash type spin default {} min 1 max 4096", DEFAULT_HASH_MB);
                 println!("option name Threads type spin default 1 min 1 max 8");
                 println!("option name UseNNUE type check default true");
+                println!("option name Ponder type check default false");
                 println!("uciok");
             }
             "isready" => println!("readyok"),
@@ -272,9 +288,12 @@ fn main() {
                 None => println!("info string invalid position"),
             },
             "go" => {
+                let limits = parse_go(&tokens[1..]);
                 stop.store(false, Ordering::Relaxed);
-                tx.send(Cmd::Go(parse_go(&tokens[1..]))).ok();
+                ponder.store(limits.ponder, Ordering::Relaxed);
+                tx.send(Cmd::Go(limits)).ok();
             }
+            "ponderhit" => ponder.store(false, Ordering::Relaxed),
             "stop" => stop.store(true, Ordering::Relaxed),
             "eval" => {
                 tx.send(Cmd::Eval).ok();

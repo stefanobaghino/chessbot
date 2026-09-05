@@ -5,7 +5,9 @@ A chess engine and Lichess bot built to run unattended on a Raspberry Pi 5.
 - `engine/` — Rust UCI engine: alpha-beta search (PVS, transposition table, null move,
   late move reductions, quiescence with static exchange evaluation) and a tapered
   hand-crafted evaluation (PeSTO piece-square tables plus king safety, pawn structure,
-  mobility). Move generation comes from the `cozy-chess` crate.
+  mobility). Move generation comes from the `cozy-chess` crate. Lazy SMP (`Threads`)
+  and pondering (`go ponder` / `ponderhit`, `bestmove ... ponder`) are supported; the bot
+  ponders by default (`PONDER=0` turns it off).
 - `bot/` — Python Lichess client (berserk + python-chess) that accepts challenges and
   plays them with the engine.
 - `scripts/` — match runner and analysis helpers built on fastchess and Stockfish.

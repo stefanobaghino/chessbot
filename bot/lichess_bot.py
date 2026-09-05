@@ -6,6 +6,8 @@ DOTENV_PATH (default: <repo>/.env) without overriding variables already set:
   ENGINE_PATH    path to the UCI engine binary (default: engine/target/release/chessbot-engine)
   ENGINE_HASH    hash size in MB (default 128)
   ENGINE_THREADS search threads passed as the Threads UCI option (default 1)
+  PONDER         1 to keep searching the expected reply on the opponent's time
+                 (default 1); costs a core for the whole game, 0 disables it
   MAX_GAMES      concurrent games to accept (default 1)
   SHUTDOWN_TIMEOUT  seconds to wait for games to finish after SIGTERM/SIGINT before
                  resigning them and exiting (default 900)
@@ -104,6 +106,7 @@ class Config:
         self.engine_path = os.environ.get("ENGINE_PATH", str(ROOT / "engine/target/release/chessbot-engine"))
         self.engine_hash = int(os.environ.get("ENGINE_HASH", "128"))
         self.engine_threads = int(os.environ.get("ENGINE_THREADS", "1"))
+        self.ponder = os.environ.get("PONDER", "1") == "1"
         self.max_games = int(os.environ.get("MAX_GAMES", "1"))
         self.shutdown_timeout = float(os.environ.get("SHUTDOWN_TIMEOUT", "900"))
         self.stream_read_timeout = float(os.environ.get("STREAM_READ_TIMEOUT", "90"))
@@ -365,13 +368,18 @@ class Game(threading.Thread):
                 return engine
         limit = chess.engine.Limit(white_clock=wtime / 1000, black_clock=btime / 1000,
                                    white_inc=winc / 1000, black_inc=binc / 1000)
-        # First move: play fast, clocks are not running yet.
-        if len(board.move_stack) < 2:
+        # First move: play fast, clocks are not running yet. No pondering from a fixed-time
+        # limit either: python-chess reuses the limit for the ponder, and a ponderhit would
+        # then not know the clocks.
+        first = len(board.move_stack) < 2
+        if first:
             limit = chess.engine.Limit(time=0.5)
         result = None
         for attempt in range(3):
             try:
-                result = engine.play(board, limit)
+                # With ponder=True python-chess keeps the engine searching the expected reply
+                # after bestmove, sends ponderhit if the opponent plays it, stop otherwise.
+                result = engine.play(board, limit, ponder=self.cfg.ponder and not first, game=self.game_id)
                 break
             except chess.engine.EngineTerminatedError:
                 log.warning("game %s: engine died during search, re-spawning (attempt %d)", self.game_id, attempt + 1)

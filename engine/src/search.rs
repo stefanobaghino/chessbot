@@ -27,6 +27,9 @@ pub struct Limits {
     pub depth: Option<i32>,
     pub nodes: Option<u64>,
     pub infinite: bool,
+    /// `go ponder`: search the expected reply without a clock until `ponderhit` (the shared
+    /// ponder flag drops) turns it into a normal timed search, or `stop` ends it.
+    pub ponder: bool,
 }
 
 pub struct MoveList {
@@ -74,6 +77,12 @@ pub struct Searcher {
     pub use_nnue: bool,
     accs: Vec<Accumulator>,
     stop: Arc<AtomicBool>,
+    /// Shared with the UCI front end: true while a `go ponder` search waits for `ponderhit`.
+    pub ponder_flag: Arc<AtomicBool>,
+    /// This search started as a ponder and has not received `ponderhit` yet.
+    pondering: bool,
+    /// Time limits to apply on `ponderhit`, from the clocks of the `go ponder` command.
+    ponder_limits: (Option<Duration>, Option<Duration>),
     killers: [[Option<Move>; 2]; MAX_PLY],
     history: [[[i32; 64]; 64]; 2],
     cont_hist: Vec<i32>,
@@ -251,6 +260,9 @@ impl Searcher {
             use_nnue,
             accs: vec![Accumulator::default(); MAX_PLY + 2],
             stop,
+            ponder_flag: Arc::new(AtomicBool::new(false)),
+            pondering: false,
+            ponder_limits: (None, None),
             killers: [[None; 2]; MAX_PLY],
             history: [[[0; 64]; 64]; 2],
             cont_hist: vec![0; CONT_TABLES * PIECE_TO * PIECE_TO],
@@ -321,7 +333,22 @@ impl Searcher {
         self.soft_limit = None;
         self.hard_limit = None;
         self.node_limit = limits.nodes;
+        self.pondering = false;
         if limits.infinite {
+            return;
+        }
+        if limits.ponder {
+            // Compute the clock limits now, apply them when ponderhit arrives; a ponder
+            // without clocks gets a second on ponderhit rather than searching forever.
+            let mut timed = Limits { ponder: false, ..limits.clone() };
+            if timed.wtime.is_none() && timed.btime.is_none() && timed.movetime.is_none() {
+                timed.movetime = Some(1000);
+            }
+            self.set_limits(board, &timed);
+            self.ponder_limits = (self.soft_limit, self.hard_limit);
+            self.soft_limit = None;
+            self.hard_limit = None;
+            self.pondering = true;
             return;
         }
         if let Some(mt) = limits.movetime {
@@ -347,11 +374,25 @@ impl Searcher {
         }
     }
 
+    /// While pondering, watches for ponderhit: the clock starts and the limits computed
+    /// from the `go ponder` command take effect.
+    #[inline]
+    fn poll_ponderhit(&mut self) {
+        if self.pondering && !self.ponder_flag.load(Ordering::Relaxed) {
+            self.pondering = false;
+            self.start = Instant::now();
+            (self.soft_limit, self.hard_limit) = self.ponder_limits;
+        }
+    }
+
     #[inline]
     fn check_time(&mut self) {
         if self.stop.load(Ordering::Relaxed) {
             self.aborted = true;
             return;
+        }
+        if self.nodes & 1023 == 0 {
+            self.poll_ponderhit();
         }
         if let Some(n) = self.node_limit {
             if self.nodes >= n {
@@ -420,10 +461,11 @@ impl Searcher {
         let mut best_score = -INF;
         let mut prev_score = -INF;
         let mut stable = 0;
-        let base_soft = self.soft_limit;
         let max_depth = limits.depth.unwrap_or(MAX_PLY as i32 - 1).min(MAX_PLY as i32 - 1);
         let mut depth = 1 + (self.thread_id % 2) as i32;
         while depth <= max_depth {
+            self.poll_ponderhit();
+            let base_soft = self.soft_limit;
             self.seldepth = 0;
             let mut delta = 18;
             let mut alpha = if depth >= 5 { (best_score - delta).max(-INF) } else { -INF };
@@ -496,6 +538,14 @@ impl Searcher {
             depth += 1;
         }
         Some(best_move)
+    }
+
+    /// The reply the search expects after `best`, for `bestmove ... ponder`.
+    pub fn ponder_move(&self, board: &Board, best: Move) -> Option<Move> {
+        let mut b = board.clone();
+        b.play_unchecked(best);
+        let m = self.tt.probe(b.hash())?.best_move()?;
+        if b.is_legal(m) { Some(m) } else { None }
     }
 
     fn print_info(&self, board: &Board, depth: i32, score: i32) {
@@ -1029,6 +1079,58 @@ mod tests {
 
     fn searcher() -> Searcher {
         Searcher::new(Arc::new(TranspositionTable::new(8)), Arc::new(AtomicBool::new(false)), Arc::new(AtomicU64::new(0)), 0)
+    }
+
+    #[test]
+    fn ponder_search_waits_for_ponderhit_then_uses_the_clock() {
+        let mut s = searcher();
+        s.silent = true;
+        let flag = Arc::new(AtomicBool::new(true));
+        s.ponder_flag = flag.clone();
+        let b = Board::default();
+        let limits = Limits { wtime: Some(600), btime: Some(600), ponder: true, ..Default::default() };
+        let t0 = Instant::now();
+        let handle = std::thread::spawn(move || {
+            let mv = s.go(&b, &[], &limits);
+            (mv, s.nodes)
+        });
+        std::thread::sleep(Duration::from_millis(300));
+        flag.store(false, Ordering::Relaxed); // ponderhit
+        let (mv, nodes) = handle.join().unwrap();
+        let elapsed = t0.elapsed();
+        assert!(mv.is_some());
+        assert!(nodes > 1000, "pondered {} nodes", nodes);
+        // 300 ms of pondering plus a timed search on a 600 ms clock: well under two seconds,
+        // and clearly longer than the 300 ms wait alone.
+        assert!(elapsed > Duration::from_millis(300) && elapsed < Duration::from_millis(2000), "{:?}", elapsed);
+    }
+
+    #[test]
+    fn ponder_search_stops_on_stop() {
+        let mut s = searcher();
+        s.silent = true;
+        let stop = Arc::new(AtomicBool::new(false));
+        let flag = Arc::new(AtomicBool::new(true));
+        s.stop = stop.clone();
+        s.ponder_flag = flag.clone();
+        let b = Board::default();
+        let limits = Limits { wtime: Some(600), btime: Some(600), ponder: true, ..Default::default() };
+        let handle = std::thread::spawn(move || s.go(&b, &[], &limits));
+        std::thread::sleep(Duration::from_millis(200));
+        stop.store(true, Ordering::Relaxed);
+        assert!(handle.join().unwrap().is_some());
+    }
+
+    #[test]
+    fn ponder_move_is_the_expected_reply() {
+        let mut s = searcher();
+        s.silent = true;
+        let b = Board::default();
+        let mv = s.go(&b, &[], &Limits { depth: Some(6), ..Default::default() }).unwrap();
+        let reply = s.ponder_move(&b, mv).unwrap();
+        let mut after = b.clone();
+        after.play_unchecked(mv);
+        assert!(after.is_legal(reply));
     }
 
     #[test]

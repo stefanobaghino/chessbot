@@ -99,7 +99,7 @@ def test_drain_timeout_resigns():
 
 
 class DeadEngine:
-    def play(self, board, limit):
+    def play(self, board, limit, **kwargs):
         import chess.engine
 
         raise chess.engine.EngineTerminatedError("dead")
@@ -113,11 +113,13 @@ class DeadEngine:
 class LiveEngine:
     def __init__(self):
         self.played = 0
+        self.calls = []
 
-    def play(self, board, limit):
+    def play(self, board, limit, **kwargs):
         import chess
 
         self.played += 1
+        self.calls.append((limit, kwargs))
         return chess.engine.PlayResult(next(iter(board.legal_moves)), None)
 
     def quit(self):
@@ -133,12 +135,36 @@ def test_engine_is_respawned_mid_game():
     g.client = type("Client", (), {})()
     g.client.bots = FakeBots()
     g.client.bots.make_move = lambda gid, uci: None
+    g.cfg = type("Cfg", (), {"ponder": True})()
     live = LiveEngine()
     g.new_engine = lambda: live
     board = chess.Board()
     engine = g.maybe_move(DeadEngine(), board, chess.WHITE, {"wtime": 60000, "btime": 60000})
     assert engine is live
     assert live.played == 1
+
+
+def test_maybe_move_ponders_after_the_first_move():
+    import chess
+
+    g = Game.__new__(Game)
+    g.game_id = "g1"
+    g.book = None
+    g.client = type("Client", (), {})()
+    g.client.bots = FakeBots()
+    g.client.bots.make_move = lambda gid, uci: None
+    g.cfg = type("Cfg", (), {"ponder": True})()
+    live = LiveEngine()
+    board = chess.Board()
+    g.maybe_move(live, board, chess.WHITE, {"wtime": 60000, "btime": 60000})
+    board.push_uci("e2e4")
+    board.push_uci("e7e5")
+    g.maybe_move(live, board, chess.WHITE, {"wtime": 60000, "btime": 60000})
+    assert [c[1] for c in live.calls] == [{"ponder": False, "game": "g1"}, {"ponder": True, "game": "g1"}]
+    assert live.calls[0][0].time == 0.5 and live.calls[1][0].white_clock == 60.0
+    g.cfg.ponder = False
+    g.maybe_move(live, board, chess.WHITE, {"wtime": 60000, "btime": 60000})
+    assert live.calls[-1][1] == {"ponder": False, "game": "g1"}
 
 
 def test_quit_engine_tolerates_dead_engine():
@@ -408,7 +434,7 @@ def test_play_reconnects_stream_after_transport_error(monkeypatch):
 
     monkeypatch.setattr(time, "sleep", lambda s: None)
     g = make_game()
-    g.cfg = type("Cfg", (), {"engine_path": "x", "engine_hash": 16})()
+    g.cfg = type("Cfg", (), {"engine_path": "x", "engine_hash": 16, "ponder": True})()
     g.new_engine = lambda: LiveEngine()
     g.quit_engine = lambda e: None
     opened = []
