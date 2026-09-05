@@ -25,6 +25,9 @@ DOTENV_PATH (default: <repo>/.env) without overriding variables already set:
   IDLE_ACCEPT_TIMEOUT  seconds to wait for an opponent before cancelling (default 20)
   IDLE_PAUSE_FILE  while this file exists, no idle challenges are made (default:
                  unset); SIGUSR1 toggles idle challenging at runtime as well
+SIGHUP re-reads every IDLE_* setting except IDLE_CHALLENGE from the .env file and the
+environment (the file wins) on the running process, so ops can retune idle games
+without a restart; the new values are logged, a bad value keeps the old ones.
 
 The 24 h game counter is seeded from the Lichess games API at start-up (games against
 BOT accounts) and refreshed hourly, so it survives restarts and counts external games.
@@ -48,13 +51,14 @@ import socket
 import sys
 import threading
 import time
+from collections.abc import Mapping
 from pathlib import Path
 
 import berserk
 import chess
 import chess.engine
 import requests
-from dotenv import load_dotenv
+from dotenv import dotenv_values, load_dotenv
 
 ROOT = Path(__file__).resolve().parent.parent
 log = logging.getLogger("chessbot")
@@ -65,7 +69,8 @@ ACCEPTED_SPEEDS = {"bullet", "blitz", "rapid", "classical"}
 
 class Config:
     def __init__(self) -> None:
-        load_dotenv(os.environ.get("DOTENV_PATH", ROOT / ".env"))
+        self.dotenv_path = os.environ.get("DOTENV_PATH", str(ROOT / ".env"))
+        load_dotenv(self.dotenv_path)
         self.token = os.environ.get("LICHESS_TOKEN")
         if not self.token:
             sys.exit("LICHESS_TOKEN is not set (put it in .env)")
@@ -77,16 +82,39 @@ class Config:
         self.stream_read_timeout = float(os.environ.get("STREAM_READ_TIMEOUT", "90"))
         self.heartbeat_interval = float(os.environ.get("HEARTBEAT_INTERVAL", "300"))
         self.idle_challenge = os.environ.get("IDLE_CHALLENGE", "0") == "1"
-        limit, _, inc = os.environ.get("IDLE_CLOCK", "300+3").partition("+")
-        self.idle_clock = (int(limit), int(inc or 0))
-        self.idle_rated = os.environ.get("IDLE_RATED", "1") == "1"
-        self.idle_max_per_day = int(os.environ.get("IDLE_MAX_PER_DAY", "80"))
-        self.idle_gap = float(os.environ.get("IDLE_GAP_SECONDS", "720"))
-        self.idle_tick = float(os.environ.get("IDLE_TICK", "60"))
-        self.idle_rating_range = int(os.environ.get("IDLE_RATING_RANGE", "500"))
-        self.idle_min_games = int(os.environ.get("IDLE_MIN_GAMES", "50"))
-        self.idle_accept_timeout = float(os.environ.get("IDLE_ACCEPT_TIMEOUT", "20"))
-        self.idle_pause_file = os.environ.get("IDLE_PAUSE_FILE") or None
+        self.read_idle(os.environ)
+
+    IDLE_KEYS = ("IDLE_CLOCK", "IDLE_RATED", "IDLE_MAX_PER_DAY", "IDLE_GAP_SECONDS", "IDLE_TICK",
+                 "IDLE_RATING_RANGE", "IDLE_MIN_GAMES", "IDLE_ACCEPT_TIMEOUT", "IDLE_PAUSE_FILE")
+
+    def read_idle(self, env: Mapping[str, str | None]) -> None:
+        """Sets the idle-challenge settings from `env`; on a bad value nothing changes."""
+        limit, _, inc = (env.get("IDLE_CLOCK") or "300+3").partition("+")
+        values = {
+            "idle_clock": (int(limit), int(inc or 0)),
+            "idle_rated": (env.get("IDLE_RATED") or "1") == "1",
+            "idle_max_per_day": int(env.get("IDLE_MAX_PER_DAY") or "80"),
+            "idle_gap": float(env.get("IDLE_GAP_SECONDS") or "720"),
+            "idle_tick": float(env.get("IDLE_TICK") or "60"),
+            "idle_rating_range": int(env.get("IDLE_RATING_RANGE") or "500"),
+            "idle_min_games": int(env.get("IDLE_MIN_GAMES") or "50"),
+            "idle_accept_timeout": float(env.get("IDLE_ACCEPT_TIMEOUT") or "20"),
+            "idle_pause_file": env.get("IDLE_PAUSE_FILE") or None,
+        }
+        self.__dict__.update(values)
+
+    def reload_idle(self) -> None:
+        """Re-reads the IDLE_* settings; values in the .env file win over the process
+        environment so that editing the file is enough to change them."""
+        env: dict[str, str | None] = dict(os.environ)
+        env.update(dotenv_values(self.dotenv_path))
+        self.read_idle(env)
+
+    def idle_summary(self) -> str:
+        return (f"clock={self.idle_clock[0]}+{self.idle_clock[1]} rated={int(self.idle_rated)} "
+                f"max_per_day={self.idle_max_per_day} gap={self.idle_gap:.0f}s tick={self.idle_tick:.0f}s "
+                f"rating_range={self.idle_rating_range} min_games={self.idle_min_games} "
+                f"accept_timeout={self.idle_accept_timeout:.0f}s pause_file={self.idle_pause_file}")
 
 
 class TimeoutSession(berserk.TokenSession):
@@ -359,10 +387,19 @@ class Bot:
         for sig in (signal.SIGTERM, signal.SIGINT):
             signal.signal(sig, self.on_signal)
         signal.signal(signal.SIGUSR1, self.on_toggle_idle)
+        signal.signal(signal.SIGHUP, self.on_reload_idle)
 
     def on_toggle_idle(self, _signum, _frame) -> None:
         self.idle_paused = not self.idle_paused
         log.info("idle: %s by SIGUSR1", "paused" if self.idle_paused else "resumed")
+
+    def on_reload_idle(self, _signum, _frame) -> None:
+        try:
+            self.cfg.reload_idle()
+        except (ValueError, OSError) as e:
+            log.error("idle: settings NOT reloaded on SIGHUP (%s); keeping %s", e, self.cfg.idle_summary())
+            return
+        log.info("idle: settings reloaded on SIGHUP: %s", self.cfg.idle_summary())
 
     def seed_game_counter(self) -> int:
         """Rebuilds the 24 h counter from finished games against BOT accounts on Lichess."""

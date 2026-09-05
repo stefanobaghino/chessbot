@@ -4,7 +4,7 @@ import signal
 import threading
 import time
 
-from bot.lichess_bot import Bot, Game
+from bot.lichess_bot import Bot, Config, Game
 
 
 class FakeBots:
@@ -504,3 +504,27 @@ def test_engine_threads_option_is_configured(monkeypatch):
     g.cfg = type("Cfg", (), {"engine_path": "x", "engine_hash": 64, "engine_threads": 3})()
     g.new_engine()
     assert configured == {"Hash": 64, "Threads": 3}
+
+
+def test_sighup_reloads_idle_settings_from_dotenv(tmp_path, monkeypatch):
+    env = tmp_path / ".env"
+    env.write_text("IDLE_CLOCK=300+3\n")
+    monkeypatch.setenv("DOTENV_PATH", str(env))
+    monkeypatch.setenv("LICHESS_TOKEN", "x")
+    monkeypatch.delenv("IDLE_CLOCK", raising=False)
+    cfg = Config()
+    assert cfg.idle_clock == (300, 3) and cfg.idle_rated
+    b = make_bot()
+    b.cfg = cfg
+    env.write_text("IDLE_CLOCK=120+1\nIDLE_RATED=0\nIDLE_GAP_SECONDS=30\n")
+    b.on_reload_idle(signal.SIGHUP, None)
+    assert cfg.idle_clock == (120, 1) and not cfg.idle_rated and cfg.idle_gap == 30
+    # A bad value keeps the previous settings.
+    env.write_text("IDLE_CLOCK=bogus\n")
+    b.on_reload_idle(signal.SIGHUP, None)
+    assert cfg.idle_clock == (120, 1)
+    # A key removed from the file falls back to the environment, then the default.
+    env.write_text("")
+    monkeypatch.setenv("IDLE_MAX_PER_DAY", "10")
+    b.on_reload_idle(signal.SIGHUP, None)
+    assert cfg.idle_clock == (300, 3) and cfg.idle_max_per_day == 10
