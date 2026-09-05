@@ -32,6 +32,10 @@ and publishes a GitHub Release whose notes cover every commit since the previous
 tag (`MANUAL:` lines in commit messages are hoisted to the top). The `pre-push`
 hook refuses to push an untagged `main`, so this is the only way commits reach
 GitHub. Logs land in `ci/logs/`, the last outcome in `ci/last_result`.
+`validate.sh` waits up to 10 minutes for `VALIDATE_MIN_MEM_MB` (1500) of free memory before
+building, builds every tree in the shared `ci/target` so dependencies compile once, and skips
+the test suites (`VALIDATE_SKIP_TESTS=1`, set by `release.sh`) when the pre-commit hook has
+already validated the exact tree being released (stamps in `ci/validated/`).
 
 ## Measure strength
 

@@ -25,6 +25,8 @@ version="v$major.$minor.$((patch + 1))"
 log="$LOGDIR/$version-${c:0:8}.log"
 echo "release: $c -> $version (log: $log)"
 work=$(mktemp -d "${TMPDIR:-/tmp}/chessbot-release.XXXXXX")
+# The pre-commit hook records the trees it validated; the same tree does not need its tests run twice.
+[ -e "$ROOT/ci/validated/$(git rev-parse "$c^{tree}")" ] && export VALIDATE_SKIP_TESTS=1
 {
   echo "commit $c"; git log --oneline "$last_tag..$c"; echo
   mkdir -p "$work/src" && git archive "$c" | tar -x -C "$work/src"

@@ -12,6 +12,7 @@ git archive "$(git write-tree)" | tar -x -C "$work/src"
 SPAR_CPUS="${SPAR_CPUS:-2-3}"
 if taskset -c "$SPAR_CPUS" "$ROOT/scripts/validate.sh" "$work/src" precommit > "$work/log" 2>&1; then
   echo "pre-commit: validate ok"
+  mkdir -p "$ROOT/ci/validated" && touch "$ROOT/ci/validated/$(git write-tree)"  # lets release.sh skip the tests
 else
   tr '\r' '\n' < "$work/log" | tail -30
   echo "pre-commit: validate FAILED (fix, or commit with --no-verify)"
