@@ -29,7 +29,9 @@ skip_tests="${VALIDATE_SKIP_TESTS:-0}"
 [ "$skip_tests" = 1 ] && echo "validate: tests skipped, this tree passed the pre-commit hook"
 [ "$skip_tests" = 1 ] || cargo test --release 2>&1 | grep -E "^test result" | grep -q " 0 failed" || { cargo test --release 2>&1 | tail -20; exit 1; }
 out=$("$BIN" bench 10); echo "$out" | grep -q "^bench: [1-9]" || { echo "bench failed: $out"; exit 1; }
-"$BIN" selfcheck | tee /dev/stderr | grep -qE "selfcheck: .* 0 mismatches|no network loaded"
+# No `tee /dev/stderr` here: when stderr is a log file, tee reopens it with truncation and
+# wipes everything written before this point (the v0.1.24-v0.1.26 release logs).
+check=$("$BIN" selfcheck); echo "$check"; echo "$check" | grep -qE "selfcheck: .* 0 mismatches|no network loaded"
 banner=$(printf 'uci\nquit\n' | "$BIN")
 echo "$banner" | grep -q "^id name chessbot-engine $VERSION " || { echo "bad banner: $banner"; exit 1; }
 cd "$SRC"
