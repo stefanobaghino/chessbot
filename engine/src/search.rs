@@ -384,7 +384,11 @@ impl Searcher {
             let inc = inc as f64;
             let mtg = limits.movestogo.map_or(24.0, |m| (m as f64).clamp(1.0, 40.0));
             let usable = (t - self.move_overhead as f64).max(1.0);
-            let soft = (usable / mtg + inc * 0.75).min(usable * 0.8);
+            // Low clock: spending the whole increment keeps the clock pinned where any
+            // hiccup flags us, so the increment share ramps down below ten increments of
+            // usable time and the clock climbs back to a reserve (#35).
+            let inc_share = if inc > 0.0 { (usable / (10.0 * inc)).min(1.0) } else { 1.0 };
+            let soft = (usable / mtg + inc * 0.75 * inc_share).min(usable * 0.8);
             let hard = (soft * 4.0).min(usable * 0.8);
             self.soft_limit = Some(Duration::from_millis(soft.max(1.0) as u64));
             self.hard_limit = Some(Duration::from_millis(hard.max(1.0) as u64));
@@ -1165,12 +1169,30 @@ mod tests {
         let limits = Limits { wtime: Some(1100), winc: Some(1000), ..Default::default() };
         s.move_overhead = 300;
         s.set_limits(&board, &limits);
-        // usable 800 ms: the hard limit is 80% of it, well under the 1 s increment.
-        assert_eq!(s.hard_limit.unwrap().as_millis(), 640);
-        assert!(s.soft_limit.unwrap() <= s.hard_limit.unwrap());
+        // usable 800 ms: the hard limit can never exceed 80% of it, and with the
+        // low-clock ramp it lands well under the 1 s increment.
+        let hard_300 = s.hard_limit.unwrap();
+        assert!(hard_300.as_millis() <= 640);
+        assert!(s.soft_limit.unwrap() <= hard_300);
         s.move_overhead = 30;
         s.set_limits(&board, &limits);
-        assert_eq!(s.hard_limit.unwrap().as_millis(), 856);
+        assert!(s.hard_limit.unwrap().as_millis() <= 856);
+        assert!(s.hard_limit.unwrap() > hard_300);
+    }
+
+    #[test]
+    fn low_clock_spends_less_than_the_increment_to_rebuild_a_reserve() {
+        let mut s = searcher();
+        let board = Board::default();
+        s.move_overhead = 300;
+        // 1.5 s left, 1 s increment: usable 1.2 s, increment share 0.12.
+        s.set_limits(&board, &Limits { wtime: Some(1500), winc: Some(1000), ..Default::default() });
+        let soft = s.soft_limit.unwrap().as_millis();
+        assert!(soft < 200, "soft {soft} ms");
+        assert!(s.hard_limit.unwrap().as_millis() <= 960);
+        // With ten increments in hand the full share applies again.
+        s.set_limits(&board, &Limits { wtime: Some(10300), winc: Some(1000), ..Default::default() });
+        assert_eq!(s.soft_limit.unwrap().as_millis(), 10000 / 24 + 750);
     }
 
     #[test]
