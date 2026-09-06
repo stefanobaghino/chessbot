@@ -4,7 +4,7 @@ import signal
 import threading
 import time
 
-from bot.lichess_bot import Bot, Config, Game, game_result
+from bot.lichess_bot import Bot, Config, Game, game_result, retry_after
 
 
 class FakeBots:
@@ -355,6 +355,26 @@ def test_challenge_once_cancels_when_not_accepted():
     assert ("cancel", "c1") in calls
     assert b.pending_challenge is None
     assert "opp" in b.skip_until
+
+
+def test_rejected_challenge_skips_the_opponent_until_the_daily_limit_resets():
+    class Rejected(Exception):
+        def __init__(self):
+            super().__init__("HTTP 400: Bad Request")
+            self.cause = {"error": "x played 100 games against other bots today", "ratelimit": {"key": "bot.vsBot.day", "seconds": 28690}}
+
+    assert retry_after(Rejected()) == 28690
+    assert retry_after(RuntimeError("boom")) is None
+    b = idle_bot()
+    b.client.bots.get_online_bots = lambda limit=None: iter([bot_entry("opp", 2050)])
+    b.client.challenges = type("Ch", (), {})()
+
+    def reject(*a, **k):
+        raise Rejected()
+
+    b.client.challenges.create = reject
+    assert b.challenge_once() is False
+    assert b.skip_until["opp"] - time.monotonic() > 28690
 
 
 def test_challenge_once_returns_true_when_game_starts():

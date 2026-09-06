@@ -215,6 +215,15 @@ def sd_notify(state: str) -> None:
         log.debug("sd_notify failed: %s", e)
 
 
+def retry_after(error: Exception) -> float | None:
+    """Seconds Lichess asks to wait before repeating a rejected request, read from the
+    `ratelimit` object of the JSON error body berserk keeps in `ResponseError.cause`."""
+    cause = getattr(error, "cause", None)
+    limit = cause.get("ratelimit") if isinstance(cause, dict) else None
+    seconds = limit.get("seconds") if isinstance(limit, dict) else None
+    return float(seconds) if isinstance(seconds, (int, float)) and seconds > 0 else None
+
+
 def bot_name(entry: dict) -> str:
     """Display name of a /api/bot/online entry (it carries username, not name)."""
     return entry.get("username") or entry.get("name") or entry.get("id") or "?"
@@ -935,8 +944,11 @@ class Bot:
         try:
             ch = self.client.challenges.create(opp["id"], rated=self.cfg.idle_rated, clock_limit=limit, clock_increment=inc)
         except Exception as e:  # noqa: BLE001
-            log.warning("idle: challenge to %s failed (%s)", bot_name(opp), e)
-            self.skip_until[opp["id"]] = time.monotonic() + 3600
+            # A bot that played its 100 bot games of the day is rejected with the time
+            # until the reset; anything else is retried after an hour (#37).
+            wait = retry_after(e) or 3600
+            log.warning("idle: challenge to %s failed, skipping it for %d min (%s)", bot_name(opp), wait // 60, e)
+            self.skip_until[opp["id"]] = time.monotonic() + wait + 60
             return False
         cid = ch.get("id") or ch.get("challenge", {}).get("id")
         with self.lock:
