@@ -13,6 +13,8 @@ A chess engine and Lichess bot built to run unattended on a Raspberry Pi 5.
   tablebase move, drawn ones keep the engine's move unless it loses. The lookup is
   skipped under `TABLEBASE_MIN_CLOCK` seconds and the engine budgets each move net of
   `MOVE_OVERHEAD` milliseconds (its `Move Overhead` option), so neither can flag the bot.
+  Without an increment the engine spends a fortieth of the clock per move instead of a
+  twenty-fourth and keeps a reserve of twenty overheads out of the budget.
   Draw aversion is rating-based (`CONTEMPT_PER_100`, `CONTEMPT_MAX`): the bot sets the
   engine's `Contempt` option from the two ratings in each game, positive against weaker
   opponents and negative against stronger ones, tapering off as material comes off.

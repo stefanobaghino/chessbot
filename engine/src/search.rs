@@ -382,8 +382,17 @@ impl Searcher {
         if let Some(t) = time {
             let t = t as f64;
             let inc = inc as f64;
-            let mtg = limits.movestogo.map_or(24.0, |m| (m as f64).clamp(1.0, 40.0));
-            let usable = (t - self.move_overhead as f64).max(1.0);
+            // Without an increment the budget is a pure geometric drain and every move
+            // still costs the bot a fixed slice of network time, so spend a smaller share
+            // per move and keep a reserve (twenty move overheads, at most a third of the
+            // clock) that the end of a long game is played from (#36).
+            let (default_mtg, reserve) = if inc > 0.0 {
+                (24.0, 0.0)
+            } else {
+                (40.0, (self.move_overhead as f64 * 20.0).min(t / 3.0))
+            };
+            let mtg = limits.movestogo.map_or(default_mtg, |m| (m as f64).clamp(1.0, 40.0));
+            let usable = (t - self.move_overhead as f64 - reserve).max(1.0);
             // Low clock: spending the whole increment keeps the clock pinned where any
             // hiccup flags us, so the increment share ramps down below ten increments of
             // usable time and the clock climbs back to a reserve (#35).
@@ -1193,6 +1202,23 @@ mod tests {
         // With ten increments in hand the full share applies again.
         s.set_limits(&board, &Limits { wtime: Some(10300), winc: Some(1000), ..Default::default() });
         assert_eq!(s.soft_limit.unwrap().as_millis(), 10000 / 24 + 750);
+    }
+
+    #[test]
+    fn no_increment_games_spend_a_smaller_share_and_keep_a_reserve() {
+        let mut s = searcher();
+        let board = Board::default();
+        s.move_overhead = 300;
+        // 60 s, no increment: reserve 6 s, usable 53.7 s, a fortieth of it per move.
+        s.set_limits(&board, &Limits { wtime: Some(60000), ..Default::default() });
+        assert_eq!(s.soft_limit.unwrap().as_millis(), 53700 / 40);
+        // 3 s left: the reserve shrinks to a third of the clock instead of freezing the engine.
+        s.set_limits(&board, &Limits { wtime: Some(3000), ..Default::default() });
+        assert_eq!(s.soft_limit.unwrap().as_millis(), 1700 / 40);
+        assert!(s.hard_limit.unwrap().as_millis() <= 1360);
+        // The same clock with an increment keeps the old budget.
+        s.set_limits(&board, &Limits { wtime: Some(60000), winc: Some(1000), ..Default::default() });
+        assert_eq!(s.soft_limit.unwrap().as_millis(), 59700 / 24 + 750);
     }
 
     #[test]
