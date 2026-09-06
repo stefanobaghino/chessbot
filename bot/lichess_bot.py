@@ -46,6 +46,12 @@ DOTENV_PATH (default: <repo>/.env) without overriding variables already set:
   TABLEBASE       1 to play 7-piece endgames from the Lichess tablebase (default 1):
                  won and lost positions take the tablebase's best move, in drawn ones
                  the engine's move is played unless it throws the draw away
+  TABLEBASE_MIN_CLOCK  seconds on our clock below which the tablebase is not consulted,
+                 the lookup being a synchronous HTTP request (default 10); above it the
+                 request timeout is a tenth of the clock, at most 2 s
+  MOVE_OVERHEAD  milliseconds per move the engine takes off the clock before budgeting a
+                 search, for the bot's lookups and the move's transport (default 300);
+                 passed as the Move Overhead UCI option
 SIGHUP re-reads every IDLE_* setting except IDLE_CHALLENGE from the .env file and the
 environment (the file wins) on the running process, so ops can retune idle games
 without a restart; the new values are logged, a bad value keeps the old ones.
@@ -140,6 +146,8 @@ class Config:
         self.book_plies = int(os.environ.get("BOOK_PLIES", "16"))
         self.book_min_games = int(os.environ.get("BOOK_MIN_GAMES", "50"))
         self.tablebase = os.environ.get("TABLEBASE", "1") == "1"
+        self.tablebase_min_clock = float(os.environ.get("TABLEBASE_MIN_CLOCK", "10"))
+        self.move_overhead = int(os.environ.get("MOVE_OVERHEAD", "300"))
         self.read_idle(os.environ)
 
     IDLE_KEYS = ("IDLE_CLOCK", "IDLE_RATED", "IDLE_MAX_PER_DAY", "IDLE_GAP_SECONDS", "IDLE_TICK",
@@ -287,12 +295,13 @@ class Tablebase:
     DECISIVE = ("win", "cursed-win", "maybe-win", "loss", "blessed-loss", "maybe-loss")
     disabled_until: ClassVar[float] = 0.0
 
-    def __init__(self, fetch=None) -> None:
+    def __init__(self, fetch=None, min_clock: float = 10.0) -> None:
         self.fetch = fetch or self.fetch_lichess
+        self.min_clock = min_clock
+        self.timeout = 2.0
 
-    @staticmethod
-    def fetch_lichess(fen: str) -> dict:
-        r = requests.get(Tablebase.URL, params={"fen": fen}, timeout=2)
+    def fetch_lichess(self, fen: str) -> dict:
+        r = requests.get(Tablebase.URL, params={"fen": fen}, timeout=self.timeout)
         if r.status_code == 429:
             Tablebase.disabled_until = time.monotonic() + 600
             log.warning("tablebase: rate limited, off for 10 min")
@@ -305,10 +314,16 @@ class Tablebase:
         return (len(board.piece_map()) <= Tablebase.MAX_PIECES
                 and not board.has_castling_rights(chess.WHITE) and not board.has_castling_rights(chess.BLACK))
 
-    def lookup(self, board: chess.Board) -> dict | None:
-        """The tablebase entry for the position, None when unavailable."""
+    def lookup(self, board: chess.Board, clock: float | None = None) -> dict | None:
+        """The tablebase entry for the position, None when unavailable. `clock` is our
+        remaining time in seconds: below `min_clock` the lookup is skipped and above it the
+        request may take at most a tenth of it (#35), so it can never flag us."""
         if not self.applies(board) or time.monotonic() < Tablebase.disabled_until:
             return None
+        if clock is not None:
+            if clock < self.min_clock:
+                return None
+            self.timeout = min(2.0, clock / 10)
         try:
             data = self.fetch(board.fen())
         except Exception as e:  # noqa: BLE001
@@ -342,7 +357,7 @@ class Game(threading.Thread):
         self.on_done = on_done
         self.clock: tuple[int, int] | None = None  # (seconds, increment) once gameFull arrived
         self.book = Book(cfg.token, cfg.book_plies, cfg.book_min_games) if cfg.book else None
-        self.tablebase = Tablebase() if cfg.tablebase else None
+        self.tablebase = Tablebase(min_clock=cfg.tablebase_min_clock) if cfg.tablebase else None
         self.contempt: int | None = None  # set from the ratings in gameFull, kept across engine respawns
 
     def run(self) -> None:
@@ -359,7 +374,8 @@ class Game(threading.Thread):
         # Own process group: a signal sent to the bot's group (or cgroup by a service
         # manager configured that way) must not kill the engine mid-search.
         engine = chess.engine.SimpleEngine.popen_uci(self.cfg.engine_path, setpgrp=True)
-        options = {"Hash": self.cfg.engine_hash, "Threads": self.cfg.engine_threads}
+        options = {"Hash": self.cfg.engine_hash, "Threads": self.cfg.engine_threads,
+                   "Move Overhead": self.cfg.move_overhead}
         if self.contempt is not None:
             options["Contempt"] = self.contempt
         engine.configure(options)
@@ -458,17 +474,19 @@ class Game(threading.Thread):
         """Plays our move if it is our turn. Returns the engine, which is re-spawned if it died."""
         if board.turn != my_color or board.is_game_over():
             return engine
+        started = time.monotonic()
         wtime = self.ms(state.get("wtime"))
         btime = self.ms(state.get("btime"))
         winc = self.ms(state.get("winc"))
         binc = self.ms(state.get("binc"))
+        ours = (wtime if my_color else btime) / 1000
         if self.book is not None:
             book_move = self.book.move(board)
             if book_move is not None:
                 log.info("game %s: book move %s", self.game_id, book_move.uci())
                 self.send_move(book_move.uci())
                 return engine
-        tb = self.tablebase.lookup(board) if self.tablebase is not None else None
+        tb = self.tablebase.lookup(board, ours) if self.tablebase is not None else None
         if tb and tb["category"] in Tablebase.DECISIVE:
             # Won: the tablebase converts (shortest DTZ, resets the 50-move counter when it
             # can); lost: it resists longest. Either way the engine has nothing to add.
@@ -506,6 +524,11 @@ class Game(threading.Thread):
                 log.info("game %s: tablebase move %s instead of %s, which loses", self.game_id, tb_move.uci(), move.uci())
                 move = tb_move
         self.send_move(move.uci())
+        spent = time.monotonic() - started
+        if spent > ours / 2:
+            # Lookup, search and transport together used most of the clock: a near miss
+            # of the kind that lost game SZCZ69mN on time (#35).
+            log.warning("game %s: move %s took %.2fs with %.1fs on the clock", self.game_id, move.uci(), spent, ours)
         return engine
 
     def send_move(self, uci: str) -> None:

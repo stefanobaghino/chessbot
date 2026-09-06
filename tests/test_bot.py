@@ -591,10 +591,10 @@ def test_engine_threads_option_is_configured(monkeypatch):
 
     monkeypatch.setattr(chess.engine.SimpleEngine, "popen_uci", staticmethod(lambda path, setpgrp=False: FakeEngine()))
     g = make_game()
-    g.cfg = type("Cfg", (), {"engine_path": "x", "engine_hash": 64, "engine_threads": 3})()
+    g.cfg = type("Cfg", (), {"engine_path": "x", "engine_hash": 64, "engine_threads": 3, "move_overhead": 250})()
     g.contempt = None
     g.new_engine()
-    assert configured == {"Hash": 64, "Threads": 3}
+    assert configured == {"Hash": 64, "Threads": 3, "Move Overhead": 250}
     g.contempt = -12  # a respawned engine gets the game's contempt back
     g.new_engine()
     assert configured["Contempt"] == -12
@@ -913,6 +913,38 @@ def test_tablebase_lets_the_engine_play_draws_but_not_lose_them():
     g, sent, engine = tb_game(lambda fen: data, "d1e2")
     g.maybe_move(engine, board, chess.WHITE, {"wtime": 60000, "btime": 60000})
     assert sent == ["d2d3"] and engine.played == 1
+
+
+def test_tablebase_is_skipped_at_low_clock_and_its_timeout_follows_the_clock():
+    import chess
+
+    calls = []
+
+    def fetch(fen):
+        calls.append(fen)
+        return tb_data("win", ("e3d3", "loss"))
+
+    board = chess.Board("8/8/8/8/8/4k3/4p3/4K3 b - - 0 1")
+    g, sent, engine = tb_game(fetch, "e3d4")
+    g.tablebase.min_clock = 10.0
+    g.maybe_move(engine, board, chess.BLACK, {"wtime": 60000, "btime": 9000})
+    assert calls == [] and engine.played == 1 and sent == ["e3d4"]
+    g.maybe_move(engine, board, chess.BLACK, {"wtime": 60000, "btime": 12000})
+    assert calls == [board.fen()] and sent == ["e3d4", "e3d3"]
+    assert g.tablebase.timeout == 1.2
+    g.maybe_move(engine, board, chess.BLACK, {"wtime": 60000, "btime": 120000})
+    assert g.tablebase.timeout == 2.0
+
+
+def test_slow_move_is_logged_when_it_eats_most_of_the_clock(caplog):
+    import chess
+
+    g, _sent, engine = tb_game(lambda fen: tb_data("draw"), "e3d4")
+    g.tablebase = None
+    board = chess.Board("8/8/8/8/8/4k3/4p3/4K3 b - - 0 1")
+    with caplog.at_level("WARNING"):
+        g.maybe_move(engine, board, chess.BLACK, {"wtime": 60000, "btime": 0})
+    assert "took" in caplog.text and "on the clock" in caplog.text
 
 
 def test_tablebase_is_skipped_when_it_does_not_apply():

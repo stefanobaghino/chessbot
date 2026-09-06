@@ -10,7 +10,9 @@ A chess engine and Lichess bot built to run unattended on a Raspberry Pi 5.
   ponders by default (`PONDER=0` turns it off).
   The bot plays the first moves from the Lichess masters explorer (`BOOK`) and 7-piece
   endgames from the Lichess tablebase (`TABLEBASE`): won and lost positions take the
-  tablebase move, drawn ones keep the engine's move unless it loses.
+  tablebase move, drawn ones keep the engine's move unless it loses. The lookup is
+  skipped under `TABLEBASE_MIN_CLOCK` seconds and the engine budgets each move net of
+  `MOVE_OVERHEAD` milliseconds (its `Move Overhead` option), so neither can flag the bot.
   Draw aversion is rating-based (`CONTEMPT_PER_100`, `CONTEMPT_MAX`): the bot sets the
   engine's `Contempt` option from the two ratings in each game, positive against weaker
   opponents and negative against stronger ones, tapering off as material comes off.

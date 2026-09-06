@@ -85,6 +85,9 @@ pub struct Searcher {
     /// Centipawns a draw costs the root side (UCI `Contempt`): positive avoids draws,
     /// negative seeks them. Tapers to zero as material comes off, see `draw_score`.
     pub contempt: i32,
+    /// Milliseconds taken off the clock before budgeting a move, for what happens around
+    /// the search (the bot's lookups and the move's transport); the `Move Overhead` option.
+    pub move_overhead: u64,
     /// Time limits to apply on `ponderhit`, from the clocks of the `go ponder` command.
     ponder_limits: (Option<Duration>, Option<Duration>),
     killers: [[Option<Move>; 2]; MAX_PLY],
@@ -275,6 +278,7 @@ impl Searcher {
             pondering: false,
             ponder_limits: (None, None),
             contempt: 0,
+            move_overhead: 100,
             killers: [[None; 2]; MAX_PLY],
             history: [[[0; 64]; 64]; 2],
             cont_hist: vec![0; CONT_TABLES * PIECE_TO * PIECE_TO],
@@ -379,8 +383,7 @@ impl Searcher {
             let t = t as f64;
             let inc = inc as f64;
             let mtg = limits.movestogo.map_or(24.0, |m| (m as f64).clamp(1.0, 40.0));
-            let overhead = 30.0;
-            let usable = (t - overhead).max(1.0);
+            let usable = (t - self.move_overhead as f64).max(1.0);
             let soft = (usable / mtg + inc * 0.75).min(usable * 0.8);
             let hard = (soft * 4.0).min(usable * 0.8);
             self.soft_limit = Some(Duration::from_millis(soft.max(1.0) as u64));
@@ -1153,6 +1156,21 @@ mod tests {
         // 300 ms of pondering plus a timed search on a 600 ms clock: well under two seconds,
         // and clearly longer than the 300 ms wait alone.
         assert!(elapsed > Duration::from_millis(300) && elapsed < Duration::from_millis(2000), "{:?}", elapsed);
+    }
+
+    #[test]
+    fn move_overhead_is_taken_off_the_clock_before_budgeting() {
+        let mut s = searcher();
+        let board = Board::default();
+        let limits = Limits { wtime: Some(1100), winc: Some(1000), ..Default::default() };
+        s.move_overhead = 300;
+        s.set_limits(&board, &limits);
+        // usable 800 ms: the hard limit is 80% of it, well under the 1 s increment.
+        assert_eq!(s.hard_limit.unwrap().as_millis(), 640);
+        assert!(s.soft_limit.unwrap() <= s.hard_limit.unwrap());
+        s.move_overhead = 30;
+        s.set_limits(&board, &limits);
+        assert_eq!(s.hard_limit.unwrap().as_millis(), 856);
     }
 
     #[test]

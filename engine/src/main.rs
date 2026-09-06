@@ -30,6 +30,7 @@ enum Cmd {
     SetHash(usize),
     SetThreads(usize),
     SetContempt(i32),
+    SetMoveOverhead(u64),
     UseNnue(bool),
     Bench(i32),
     Eval,
@@ -152,6 +153,9 @@ fn search_thread(rx: mpsc::Receiver<Cmd>, stop: Arc<AtomicBool>, ponder: Arc<Ato
                     h.contempt = c;
                 }
             }
+            Cmd::SetMoveOverhead(ms) => {
+                searcher.move_overhead = ms;
+            }
             Cmd::UseNnue(v) => {
                 searcher.use_nnue = v && searcher.net.is_some();
                 for h in helpers.iter_mut() {
@@ -265,6 +269,7 @@ fn main() {
                 println!("option name UseNNUE type check default true");
                 println!("option name Ponder type check default false");
                 println!("option name Contempt type spin default 0 min -100 max 100");
+                println!("option name Move Overhead type spin default 100 min 0 max 5000");
                 println!("uciok");
             }
             "isready" => println!("readyok"),
@@ -289,6 +294,11 @@ fn main() {
                     if name.eq_ignore_ascii_case("Contempt") {
                         if let Ok(c) = value.parse::<i32>() {
                             tx.send(Cmd::SetContempt(c.clamp(-100, 100))).ok();
+                        }
+                    }
+                    if name.eq_ignore_ascii_case("Move Overhead") {
+                        if let Ok(ms) = value.parse::<u64>() {
+                            tx.send(Cmd::SetMoveOverhead(ms.min(5000))).ok();
                         }
                     }
                     if name.eq_ignore_ascii_case("Hash") {
