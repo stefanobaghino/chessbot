@@ -4,7 +4,7 @@ import signal
 import threading
 import time
 
-from bot.lichess_bot import Bot, Config, Game
+from bot.lichess_bot import Bot, Config, Game, game_result
 
 
 class FakeBots:
@@ -35,6 +35,7 @@ def make_bot(timeout=30.0):
     b.last_line_at = None
     b.finished_at = []
     b.clock_history = []
+    b.results = []
     b.pending_challenge = None
     b.skip_until = {}
     b.my_rating = 2000
@@ -207,6 +208,55 @@ def test_games_last_24h_counts_and_prunes():
     assert b.games_last_24h() == 2
     b.handle({"type": "gameFinish", "game": {"id": "g1"}})
     assert b.games_last_24h() == 3
+    assert b.results == []
+    b.handle({"type": "gameFinish", "game": {"id": "g2", "color": "black", "winner": "white", "opponent": {"id": "x"},
+                                             "status": {"id": 30, "name": "mate"}}})
+    b.handle({"type": "gameFinish", "game": {"id": "g3", "color": "white", "opponent": {"id": "x"},
+                                             "status": {"id": 34, "name": "draw"}}})
+    assert [(o, r) for _, o, r in b.results] == [("x", "loss"), ("x", "draw")]
+
+
+def test_game_result_from_the_bots_side():
+    assert game_result("white", "white", "mate") == "win"
+    assert game_result("white", "black", "resign") == "loss"
+    assert game_result(None, "black", "stalemate") == "draw"
+    assert game_result(None, "black", "aborted") is None
+
+
+def test_rematch_declined_after_a_loss_streak():
+    b = idle_bot()
+    now = time.monotonic()
+    ch = {"id": "c", "challenger": {"id": "x", "rating": 2600}, "destUser": {"rating": 2500},
+          "variant": {"key": "standard"}, "speed": "blitz"}
+    assert b.should_accept(ch) is None
+    b.results = [(now, "x", "loss"), (now, "y", "loss"), (now, "x", "loss")]
+    assert b.should_accept(ch) is None
+    b.results.append((now, "x", "loss"))
+    assert b.should_accept(ch) == "generic"
+    assert b.should_accept({**ch, "challenger": {"id": "y", "rating": 2600}}) is None
+    b.results.append((now, "x", "draw"))
+    assert b.should_accept(ch) is None
+    b.results = [(now, "x", "loss")] * 3
+    b.cfg.decline_after_losses = 0
+    assert b.should_accept(ch) is None
+    b.cfg.decline_after_losses = 3
+    b.results = [(now - 90000, "x", "loss")] * 3
+    assert b.should_accept(ch) is None
+
+
+def test_much_stronger_challenger_declined_after_the_first_game():
+    b = idle_bot()
+    now = time.monotonic()
+    ch = {"id": "c", "challenger": {"id": "x", "rating": 2941}, "destUser": {"rating": 2560},
+          "variant": {"key": "standard"}, "speed": "blitz"}
+    assert b.should_accept(ch) is None
+    b.results = [(now, "x", "loss")]
+    assert b.should_accept(ch) == "generic"
+    assert b.should_accept({**ch, "challenger": {"id": "x", "rating": 2920}}) == "generic"
+    assert b.should_accept({**ch, "challenger": {"id": "x", "rating": 2850}}) is None
+    assert b.should_accept({**ch, "challenger": {"id": "x"}}) is None
+    b.cfg.decline_rating_gap = 0
+    assert b.should_accept(ch) is None
 
 
 def test_sd_notify_without_socket_is_noop(monkeypatch):
@@ -243,7 +293,7 @@ def idle_bot(**cfg):
     b.stream_ok = True
     defaults = {"idle_clock": (300, 3), "idle_clocks": [((300, 3), 1)], "idle_rated": True, "idle_max_per_day": 80, "idle_gap": 720.0,
                 "idle_rating_range": 500, "idle_min_games": 50, "idle_accept_timeout": 0.5, "idle_pause_file": None,
-                "idle_challenge": True}
+                "idle_challenge": True, "decline_after_losses": 3, "decline_rating_gap": 350}
     b.idle_paused = False
     b.idle_pause_logged = None
     defaults.update(cfg)
@@ -336,16 +386,17 @@ def test_seed_game_counter_counts_recent_bot_games():
     now = dt.datetime.now(dt.timezone.utc)
     games = [
         {"players": {"white": {"user": {"id": "me"}}, "black": {"user": {"id": "b1", "title": "BOT"}}},
-         "lastMoveAt": now - dt.timedelta(hours=1)},
+         "lastMoveAt": now - dt.timedelta(hours=1), "winner": "black", "status": "mate"},
         {"players": {"white": {"user": {"id": "h1"}}, "black": {"user": {"id": "me"}}},
-         "lastMoveAt": now - dt.timedelta(hours=2)},
+         "lastMoveAt": now - dt.timedelta(hours=2), "winner": "black", "status": "resign"},
         {"players": {"white": {"user": {"id": "b2", "title": "BOT"}}, "black": {"user": {"id": "me"}}},
-         "lastMoveAt": int((now - dt.timedelta(hours=3)).timestamp() * 1000)},
+         "lastMoveAt": int((now - dt.timedelta(hours=3)).timestamp() * 1000), "status": "draw"},
     ]
     b.client.games = type("G", (), {})()
     b.client.games.export_by_player = lambda *a, **k: iter(games)
     assert b.seed_game_counter() == 2
     assert b.games_last_24h() == 2
+    assert [(o, r) for _, o, r in b.results] == [("b2", "draw"), ("b1", "loss")]
     assert b.idle_ready()
     b.cfg.idle_gap = 7200
     assert not b.idle_ready()

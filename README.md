@@ -15,7 +15,10 @@ A chess engine and Lichess bot built to run unattended on a Raspberry Pi 5.
   engine's `Contempt` option from the two ratings in each game, positive against weaker
   opponents and negative against stronger ones, tapering off as material comes off.
 - `bot/` — Python Lichess client (berserk + python-chess) that accepts challenges and
-  plays them with the engine.
+  plays them with the engine. Challenges from an opponent that beat the bot
+  `DECLINE_AFTER_LOSSES` times in a row, or rated more than `DECLINE_RATING_GAP` points
+  above it after a first game, are declined so a much stronger bot cannot drain rating
+  through endless rematches.
 - `scripts/` — match runner and analysis helpers built on fastchess and Stockfish.
 
 ## Build the engine

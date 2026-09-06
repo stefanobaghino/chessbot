@@ -34,6 +34,11 @@ DOTENV_PATH (default: <repo>/.env) without overriding variables already set:
   IDLE_PAUSE_FILE  while this file exists, no idle challenges are made and incoming
                  challenges are declined (default: unset); SIGUSR1 toggles idle
                  challenging at runtime as well
+  DECLINE_AFTER_LOSSES  decline a challenger that beat the bot this many times in a
+                 row in the trailing 24 h (default 3); 0 disables the rule
+  DECLINE_RATING_GAP  decline a challenger rated more than this many points above the
+                 bot, once at least one game against it is in the trailing 24 h
+                 (default 350); 0 disables the rule
   BOOK            1 to play the first moves from the Lichess masters opening explorer
                  instead of searching (default 1); 0 disables the book
   BOOK_PLIES      plies after which the book is no longer consulted (default 16)
@@ -84,6 +89,15 @@ ACCEPTED_VARIANTS = {"standard", "fromPosition"}
 ACCEPTED_SPEEDS = {"bullet", "blitz", "rapid", "classical"}
 
 
+def game_result(winner: str | None, my_color: str | None, status: str | None) -> str | None:
+    """win/draw/loss from the bot's side, or None for games that did not count (aborted)."""
+    if winner in ("white", "black") and my_color in ("white", "black"):
+        return "win" if winner == my_color else "loss"
+    if status in ("draw", "stalemate"):
+        return "draw"
+    return None
+
+
 def parse_idle_clocks(spec: str) -> list[tuple[tuple[int, int], int]]:
     """Parses IDLE_CLOCK: comma-separated `seconds+increment[:weight]` entries."""
     clocks = []
@@ -129,7 +143,8 @@ class Config:
         self.read_idle(os.environ)
 
     IDLE_KEYS = ("IDLE_CLOCK", "IDLE_RATED", "IDLE_MAX_PER_DAY", "IDLE_GAP_SECONDS", "IDLE_TICK",
-                 "IDLE_RATING_RANGE", "IDLE_MIN_GAMES", "IDLE_ACCEPT_TIMEOUT", "IDLE_PAUSE_FILE")
+                 "IDLE_RATING_RANGE", "IDLE_MIN_GAMES", "IDLE_ACCEPT_TIMEOUT", "IDLE_PAUSE_FILE",
+                 "DECLINE_AFTER_LOSSES", "DECLINE_RATING_GAP")
 
     def read_idle(self, env: Mapping[str, str | None]) -> None:
         """Sets the idle-challenge settings from `env`; on a bad value nothing changes."""
@@ -145,6 +160,8 @@ class Config:
             "idle_min_games": int(env.get("IDLE_MIN_GAMES") or "50"),
             "idle_accept_timeout": float(env.get("IDLE_ACCEPT_TIMEOUT") or "20"),
             "idle_pause_file": env.get("IDLE_PAUSE_FILE") or None,
+            "decline_after_losses": int(env.get("DECLINE_AFTER_LOSSES") or "3"),
+            "decline_rating_gap": int(env.get("DECLINE_RATING_GAP") or "350"),
         }
         self.__dict__.update(values)
 
@@ -159,7 +176,8 @@ class Config:
         return (f"clock={idle_clock_spec(self.idle_clocks)} rated={int(self.idle_rated)} "
                 f"max_per_day={self.idle_max_per_day} gap={self.idle_gap:.0f}s tick={self.idle_tick:.0f}s "
                 f"rating_range={self.idle_rating_range} min_games={self.idle_min_games} "
-                f"accept_timeout={self.idle_accept_timeout:.0f}s pause_file={self.idle_pause_file}")
+                f"accept_timeout={self.idle_accept_timeout:.0f}s pause_file={self.idle_pause_file} "
+                f"decline_after_losses={self.decline_after_losses} decline_rating_gap={self.decline_rating_gap}")
 
 
 class TimeoutSession(berserk.TokenSession):
@@ -552,6 +570,7 @@ class Bot:
         self.last_line_at: float | None = None
         self.finished_at: list[float] = []
         self.clock_history: list[tuple[float, tuple[int, int]]] = []  # (monotonic end, clock) of bot games, 24 h
+        self.results: list[tuple[float, str, str]] = []  # (monotonic end, opponent id, win/draw/loss), 24 h
         self.pending_challenge: str | None = None
         self.idle_paused = False
         self.idle_pause_logged: str | None = None
@@ -637,9 +656,11 @@ class Bot:
         since_ms = int((now_wall - 86400) * 1000)
         stamps = []
         clocks: list[tuple[float, tuple[int, int]]] = []
+        results: list[tuple[float, str, str]] = []
         for g in self.client.games.export_by_player(self.my_id, since=since_ms, max=200, moves=False, finished=True):
             players = g.get("players", {})
-            opp = players.get("black" if players.get("white", {}).get("user", {}).get("id") == self.my_id else "white", {})
+            i_am_white = players.get("white", {}).get("user", {}).get("id") == self.my_id
+            opp = players.get("black" if i_am_white else "white", {})
             if opp.get("user", {}).get("title") != "BOT":
                 continue
             clock = g.get("clock") or {}
@@ -653,9 +674,14 @@ class Bot:
             stamps.append(now_mono - (now_wall - ended))
             if "initial" in clock:
                 clocks.append((stamps[-1], (int(clock["initial"]), int(clock.get("increment") or 0))))
+            result = game_result(g.get("winner"), "white" if i_am_white else "black", g.get("status"))
+            opp_id = opp.get("user", {}).get("id")
+            if result and opp_id:
+                results.append((stamps[-1], opp_id, result))
         with self.lock:
             self.finished_at = sorted(stamps)
             self.clock_history = sorted(clocks)
+            self.results = sorted(results)
         return len(stamps)
 
     def refresh_game_counter(self) -> None:
@@ -713,10 +739,40 @@ class Bot:
             return "variant"
         if challenge.get("speed") not in ACCEPTED_SPEEDS:
             return "timeControl"
+        if self.opponent_decline_reason(challenge):
+            return "generic"
         with self.lock:
             if len(self.games) >= self.cfg.max_games:
                 return "later"
         return None
+
+    def opponent_decline_reason(self, challenge: dict) -> str | None:
+        """Why a challenger should be turned away on the strength of the trailing 24 h of
+        results against it (see #34): a streak of DECLINE_AFTER_LOSSES losses, or a
+        challenger more than DECLINE_RATING_GAP points above the bot once a first game
+        against it has been played. Logged, since the reason sent to Lichess is generic."""
+        challenger = challenge.get("challenger", {})
+        opp = challenger.get("id")
+        if not opp:
+            return None
+        cutoff = time.monotonic() - 86400
+        with self.lock:
+            self.results = [r for r in self.results if r[0] >= cutoff]
+            history = [r for _, o, r in self.results if o == opp]
+        if not history:
+            return None
+        streak = self.cfg.decline_after_losses
+        if streak and len(history) >= streak and all(r == "loss" for r in history[-streak:]):
+            why = f"{streak} straight losses to {opp}"
+        else:
+            gap = self.cfg.decline_rating_gap
+            mine = challenge.get("destUser", {}).get("rating")
+            theirs = challenger.get("rating")
+            if not (gap and mine and theirs and theirs - mine > gap):
+                return None
+            why = f"{opp} is {theirs - mine} points above us after {len(history)} game(s)"
+        log.info("declining challenge %s: %s", challenge.get("id"), why)
+        return why
 
     def games_last_24h(self) -> int:
         cutoff = time.monotonic() - 86400
@@ -942,8 +998,14 @@ class Bot:
                 self.games[game_id] = g
             g.start()
         elif kind == "gameFinish":
+            game = event.get("game", {})
+            status = game.get("status")
+            result = game_result(game.get("winner"), game.get("color"), status.get("name") if isinstance(status, dict) else status)
+            opp = game.get("opponent", {}).get("id")
             with self.lock:
                 self.finished_at.append(time.monotonic())
+                if result and opp:
+                    self.results.append((time.monotonic(), opp, result))
         elif kind in ("challengeDeclined", "challengeCanceled"):
             ch = event.get("challenge", {})
             with self.lock:
