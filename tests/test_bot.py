@@ -309,8 +309,10 @@ def bot_entry(bid, rating, games=100, prov=False):
 def test_pick_opponent_filters_candidates():
     b = idle_bot()
     b.skip_until["skipped"] = time.monotonic() + 100
+    now = time.monotonic()
+    b.results = [(now, "beat_us", "loss")] * 3 + [(now, "good", "loss")] * 2
     bots = [bot_entry("me", 2000), bot_entry("far", 2600), bot_entry("new", 2000, games=3), bot_entry("skipped", 2000),
-            bot_entry("prov", 2000, prov=True), bot_entry("good", 2100)]
+            bot_entry("prov", 2000, prov=True), bot_entry("beat_us", 2000), bot_entry("good", 2100)]
     assert b.pick_opponent(bots)["id"] == "good"
     assert b.pick_opponent([]) is None
 

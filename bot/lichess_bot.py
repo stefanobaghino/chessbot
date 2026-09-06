@@ -769,6 +769,17 @@ class Bot:
                 return "later"
         return None
 
+    def results_against(self, opp: str) -> list[str]:
+        """Our results against `opp` in the trailing 24 h, oldest first."""
+        cutoff = time.monotonic() - 86400
+        with self.lock:
+            self.results = [r for r in self.results if r[0] >= cutoff]
+            return [r for _, o, r in self.results if o == opp]
+
+    def loss_streak(self, history: list[str]) -> bool:
+        streak = self.cfg.decline_after_losses
+        return bool(streak) and len(history) >= streak and all(r == "loss" for r in history[-streak:])
+
     def opponent_decline_reason(self, challenge: dict) -> str | None:
         """Why a challenger should be turned away on the strength of the trailing 24 h of
         results against it (see #34): a streak of DECLINE_AFTER_LOSSES losses, or a
@@ -778,14 +789,11 @@ class Bot:
         opp = challenger.get("id")
         if not opp:
             return None
-        cutoff = time.monotonic() - 86400
-        with self.lock:
-            self.results = [r for r in self.results if r[0] >= cutoff]
-            history = [r for _, o, r in self.results if o == opp]
+        history = self.results_against(opp)
         if not history:
             return None
         streak = self.cfg.decline_after_losses
-        if streak and len(history) >= streak and all(r == "loss" for r in history[-streak:]):
+        if self.loss_streak(history):
             why = f"{streak} straight losses to {opp}"
         else:
             gap = self.cfg.decline_rating_gap
@@ -853,6 +861,8 @@ class Bot:
             bid = b.get("id")
             if not bid or bid == self.my_id or self.skip_until.get(bid, 0) > now:
                 continue
+            if self.loss_streak(self.results_against(bid)):
+                continue  # the same streak rule as for incoming challenges (#34)
             blitz = b.get("perfs", {}).get("blitz", {})
             if blitz.get("games", 0) < self.cfg.idle_min_games or blitz.get("prov"):
                 continue
