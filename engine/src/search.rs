@@ -881,6 +881,7 @@ impl Searcher {
             let non_pawn = board.colors(stm) & !(board.pieces(Piece::Pawn) | board.pieces(Piece::King));
             if allow_null && depth >= 3 && static_eval >= beta && !non_pawn.is_empty() {
                 if let Some(nb) = board.null_move() {
+                    self.tt.prefetch(nb.hash());
                     let r = 3 + depth / 4 + ((static_eval - beta) / 200).min(3);
                     self.hashes.push(nb.hash());
                     self.accs[ply + 1] = self.accs[ply];
@@ -988,6 +989,7 @@ impl Searcher {
 
             let mut child = board.clone();
             child.play_unchecked(mv);
+            self.tt.prefetch(child.hash());
             self.hashes.push(child.hash());
             self.push_acc(board, mv, ply);
             self.ss_piece_to[ply] = Some(piece_index(board, mv.from) * 64 + mv.to as usize);
@@ -1178,6 +1180,7 @@ impl Searcher {
             }
             let mut child = board.clone();
             child.play_unchecked(mv);
+            self.tt.prefetch(child.hash());
             self.push_acc(board, mv, ply);
             let score = -self.qsearch(&child, ply + 1, -beta, -alpha);
             if self.aborted {

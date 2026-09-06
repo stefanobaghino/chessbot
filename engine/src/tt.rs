@@ -1,5 +1,5 @@
 //! Lock-free shared transposition table: 16-byte entries stored as two atomics
-//! (key ^ data, data) so torn writes are detected on probe.
+//! (key ^ data, data) so torn writes are detected on probe, four to a cache line.
 
 use cozy_chess::{Move, Piece, Square};
 use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
@@ -90,8 +90,23 @@ struct Slot {
     data: AtomicU64,
 }
 
+impl Slot {
+    const fn empty() -> Slot {
+        Slot { key: AtomicU64::new(0), data: AtomicU64::new(0) }
+    }
+}
+
+/// Four entries sharing a cache line (#30): a position may live in any of them, so a
+/// collision evicts the shallowest or oldest entry of the bucket instead of the only one.
+pub const BUCKET: usize = 4;
+
+#[repr(align(64))]
+struct Bucket {
+    slots: [Slot; BUCKET],
+}
+
 pub struct TranspositionTable {
-    table: Vec<Slot>,
+    table: Vec<Bucket>,
     mask: usize,
     age: AtomicU8,
 }
@@ -105,17 +120,19 @@ impl TranspositionTable {
 
     pub fn resize(&mut self, mb: usize) {
         let bytes = mb.max(1) * 1024 * 1024;
-        let mut n = bytes / 16;
+        let mut n = bytes / std::mem::size_of::<Bucket>();
         n = n.next_power_of_two() / 2;
-        n = n.max(1024);
-        self.table = (0..n).map(|_| Slot { key: AtomicU64::new(0), data: AtomicU64::new(0) }).collect();
+        n = n.max(256);
+        self.table = (0..n).map(|_| Bucket { slots: [Slot::empty(), Slot::empty(), Slot::empty(), Slot::empty()] }).collect();
         self.mask = n - 1;
     }
 
     pub fn clear(&self) {
-        for s in self.table.iter() {
-            s.key.store(0, Ordering::Relaxed);
-            s.data.store(0, Ordering::Relaxed);
+        for b in self.table.iter() {
+            for s in b.slots.iter() {
+                s.key.store(0, Ordering::Relaxed);
+                s.data.store(0, Ordering::Relaxed);
+            }
         }
         self.age.store(0, Ordering::Relaxed);
     }
@@ -129,27 +146,71 @@ impl TranspositionTable {
     }
 
     #[inline]
-    fn index(&self, hash: u64) -> usize {
-        (hash as usize) & self.mask
+    fn bucket(&self, hash: u64) -> &Bucket {
+        &self.table[(hash as usize) & self.mask]
+    }
+
+    /// Pulls the bucket of `hash` towards the cache; called as soon as a child position's
+    /// hash is known so the fetch overlaps with the accumulator update.
+    #[inline]
+    pub fn prefetch(&self, hash: u64) {
+        let p = self.bucket(hash) as *const Bucket;
+        #[cfg(target_arch = "aarch64")]
+        // SAFETY: prfm is a hint; it never faults and touches no register state.
+        unsafe {
+            std::arch::asm!("prfm pldl1keep, [{0}]", in(reg) p, options(nomem, nostack, preserves_flags));
+        }
+        #[cfg(target_arch = "x86_64")]
+        // SAFETY: prefetch is a hint that never faults.
+        unsafe {
+            std::arch::x86_64::_mm_prefetch(p as *const i8, std::arch::x86_64::_MM_HINT_T0);
+        }
+        #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+        let _ = p;
     }
 
     pub fn probe(&self, hash: u64) -> Option<Entry> {
-        let s = &self.table[self.index(hash)];
-        let k = s.key.load(Ordering::Relaxed);
-        let d = s.data.load(Ordering::Relaxed);
-        if d != 0 && (k ^ d) == hash {
-            Some(Entry::unpack(d))
-        } else {
-            None
+        for s in self.bucket(hash).slots.iter() {
+            let k = s.key.load(Ordering::Relaxed);
+            let d = s.data.load(Ordering::Relaxed);
+            if d != 0 && (k ^ d) == hash {
+                return Some(Entry::unpack(d));
+            }
         }
+        None
     }
 
     pub fn store(&self, hash: u64, mv: Option<Move>, score: i32, eval: i32, depth: i32, bound: Bound) {
-        let s = &self.table[self.index(hash)];
         let age = self.age();
-        let k = s.key.load(Ordering::Relaxed);
-        let d = s.data.load(Ordering::Relaxed);
-        let existing = if d != 0 && (k ^ d) == hash { Some(Entry::unpack(d)) } else { None };
+        let bucket = self.bucket(hash);
+        // The position's own slot if present, else an empty one, else the entry worth the
+        // least: shallow and from an old search.
+        let mut own: Option<(&Slot, Entry)> = None;
+        let mut empty: Option<&Slot> = None;
+        let mut worst: Option<(&Slot, i32)> = None;
+        for s in bucket.slots.iter() {
+            let k = s.key.load(Ordering::Relaxed);
+            let d = s.data.load(Ordering::Relaxed);
+            if d == 0 {
+                empty.get_or_insert(s);
+                continue;
+            }
+            let e = Entry::unpack(d);
+            if (k ^ d) == hash {
+                own = Some((s, e));
+                break;
+            }
+            let value = e.depth as i32 - 8 * ((age as i32 - e.age as i32) & 63);
+            if worst.is_none_or(|w| value < w.1) {
+                worst = Some((s, value));
+            }
+        }
+        let (slot, existing) = match (own, empty, worst) {
+            (Some((s, e)), _, _) => (s, Some(e)),
+            (None, Some(s), _) => (s, None),
+            (None, None, Some((s, _))) => (s, None),
+            (None, None, None) => return,
+        };
         if let Some(e) = existing {
             if e.age == age && bound != Bound::Exact && (depth as i8) < e.depth - 2 {
                 return;
@@ -169,21 +230,22 @@ impl TranspositionTable {
             age,
         };
         let nd = e.pack();
-        s.data.store(nd, Ordering::Relaxed);
-        s.key.store(hash ^ nd, Ordering::Relaxed);
+        slot.data.store(nd, Ordering::Relaxed);
+        slot.key.store(hash ^ nd, Ordering::Relaxed);
     }
 
     pub fn hashfull(&self) -> usize {
-        let sample = self.table.len().min(1000);
+        let sample = self.table.len().min(250);
         let age = self.age();
         let used = self.table[..sample]
             .iter()
+            .flat_map(|b| b.slots.iter())
             .filter(|s| {
                 let d = s.data.load(Ordering::Relaxed);
                 d != 0 && Entry::unpack(d).age == age
             })
             .count();
-        used * 1000 / sample
+        used * 1000 / (sample * BUCKET)
     }
 }
 
@@ -216,5 +278,30 @@ mod tests {
         assert_eq!(e.depth, 7);
         assert_eq!(e.bound(), Bound::Exact);
         assert!(tt.probe(0x1234_5678_9abc_def1).is_none());
+    }
+
+    #[test]
+    fn bucket_keeps_colliding_positions_and_evicts_the_least_valuable() {
+        let tt = TranspositionTable::new(1);
+        let base = 0x0000_0000_0000_0100u64;
+        let stride = (tt.mask as u64 + 1) << 0; // same bucket index, different keys
+        let hashes: Vec<u64> = (0..BUCKET as u64 + 1).map(|i| base + i * stride).collect();
+        for (i, h) in hashes.iter().enumerate().take(BUCKET) {
+            tt.store(*h, None, i as i32, 0, 10 + i as i32, Bound::Exact);
+        }
+        for (i, h) in hashes.iter().enumerate().take(BUCKET) {
+            assert_eq!(tt.probe(*h).expect("kept").score, i as i16);
+        }
+        // A fifth position evicts the shallowest entry (depth 10, score 0) and only that one.
+        tt.store(hashes[BUCKET], None, 99, 0, 5, Bound::Exact);
+        assert!(tt.probe(hashes[0]).is_none());
+        for (i, h) in hashes.iter().enumerate().take(BUCKET).skip(1) {
+            assert_eq!(tt.probe(*h).expect("kept").score, i as i16);
+        }
+        assert_eq!(tt.probe(hashes[BUCKET]).expect("stored").score, 99);
+        // An entry from an older search goes before a shallower one of this search.
+        tt.new_search();
+        tt.store(base + 7 * stride, None, 7, 0, 3, Bound::Exact);
+        assert!(tt.probe(base + 7 * stride).is_some());
     }
 }
