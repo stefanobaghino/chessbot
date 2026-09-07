@@ -7,6 +7,10 @@ edition = "2021"
 name = "chessbot-engine"
 path = "src/main.rs"
 
+[features]
+# Search margins become UCI options that a tuner can set between games (#39).
+tune = []
+
 [dependencies]
 cozy-chess = "0.3"
 libc = "0.2"

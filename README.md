@@ -80,6 +80,17 @@ exists, otherwise it trains (or resumes) inside the window.
 `scripts/blunders.py matches/<run>.pgn` lists the moves that lost the most in each
 lost game, `scripts/evalsym.py` checks that the static evaluation is colour-symmetric.
 
+### Tuning the search margins
+
+`cargo build --release --features tune` turns the margins in `engine/src/params.rs` into
+UCI options (listed by `uci` as `info string tunable <name> <default> <min> <max> <step>`);
+the normal build inlines them as constants and its bench is unchanged. `scripts/spsa.py
+<tune-build> <state.json> [--tune a,b] [--iterations N] [--games 8] [--nodes 20000]
+[--window 9-21]` runs SPSA over them with paired fixed-node fastchess matches on cores 2-3,
+saves its state after every iteration and resumes from it when run again; with `--window`
+it exits with status 3 before an iteration that would end after 21:00. Confirm a tuned set
+with a timed `TC=10+0.1 scripts/spar.sh` before changing the defaults.
+
 ### Sharing the machine with the live bot
 
 The Lichess bot runs on cores 0-1 (`CPUAffinity=0 1` in its systemd unit). `spar.sh`

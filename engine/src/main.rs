@@ -1,5 +1,6 @@
 mod eval;
 mod nnue;
+mod params;
 mod search;
 mod tt;
 
@@ -272,6 +273,12 @@ fn main() {
                 println!("option name Ponder type check default false");
                 println!("option name Contempt type spin default 0 min -100 max 100");
                 println!("option name Move Overhead type spin default 100 min 0 max 5000");
+                if cfg!(feature = "tune") {
+                    for (name, default, min, max, step) in params::TABLE {
+                        println!("option name {name} type spin default {default} min {min} max {max}");
+                        println!("info string tunable {name} {default} {min} {max} {step}");
+                    }
+                }
                 println!("uciok");
             }
             "isready" => println!("readyok"),
@@ -307,6 +314,10 @@ fn main() {
                         if let Ok(mb) = value.parse::<usize>() {
                             tx.send(Cmd::SetHash(mb.clamp(1, 4096))).ok();
                         }
+                    }
+                    #[cfg(feature = "tune")]
+                    if let Ok(v) = value.parse::<i32>() {
+                        params::set(&name, v);
                     }
                 }
             }

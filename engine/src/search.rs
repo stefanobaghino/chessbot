@@ -2,6 +2,7 @@
 
 use crate::eval::{self, Tables};
 use crate::nnue::{Accumulator, Network};
+use crate::params;
 use crate::tt::{Bound, TranspositionTable};
 use cozy_chess::{
     get_bishop_moves, get_king_moves, get_knight_moves, get_pawn_attacks, get_rook_moves, BitBoard, Board, Color,
@@ -569,7 +570,7 @@ impl Searcher {
             self.poll_ponderhit();
             let base_soft = self.soft_limit;
             self.seldepth = 0;
-            let mut delta = 18;
+            let mut delta = params::aspiration_delta();
             let mut alpha = if depth >= 5 { (best_score - delta).max(-INF) } else { -INF };
             let mut beta = if depth >= 5 { (best_score + delta).min(INF) } else { INF };
             let mut score = best_score;
@@ -868,11 +869,11 @@ impl Searcher {
         let stm = board.side_to_move();
 
         if !pv_node && !in_check && excluded.is_none() {
-            let rfp_margin = 75 * depth - if improving { 50 } else { 0 };
+            let rfp_margin = params::rfp_margin() * depth - if improving { params::rfp_improving() } else { 0 };
             if depth <= 8 && static_eval - rfp_margin >= beta && static_eval < MATE_IN_MAX {
                 return static_eval;
             }
-            if depth <= 3 && static_eval + 250 * depth <= alpha {
+            if depth <= 3 && static_eval + params::razor_margin() * depth <= alpha {
                 let s = self.qsearch(board, ply, alpha, beta);
                 if s <= alpha {
                     return s;
@@ -882,7 +883,7 @@ impl Searcher {
             if allow_null && depth >= 3 && static_eval >= beta && !non_pawn.is_empty() {
                 if let Some(nb) = board.null_move() {
                     self.tt.prefetch(nb.hash());
-                    let r = 3 + depth / 4 + ((static_eval - beta) / 200).min(3);
+                    let r = 3 + depth / 4 + ((static_eval - beta) / params::nmp_eval_div()).min(3);
                     self.hashes.push(nb.hash());
                     self.accs[ply + 1] = self.accs[ply];
                     self.ss_piece_to[ply] = None;
@@ -902,7 +903,7 @@ impl Searcher {
         // margin after a quiescence search and a search four plies shallower is taken as a
         // cutoff. Skipped when the table already proves the score below that margin.
         if !pv_node && !in_check && excluded.is_none() && depth >= 5 && beta.abs() < MATE_IN_MAX {
-            let pc_beta = beta + 180 - if improving { 40 } else { 0 };
+            let pc_beta = beta + params::probcut_margin() - if improving { params::probcut_improving() } else { 0 };
             let tt_refutes = tt_score != NONE_EVAL && tt_depth >= depth - 3 && tt_score < pc_beta;
             if !tt_refutes {
                 let mut caps = MoveList::new();
@@ -950,7 +951,7 @@ impl Searcher {
         let mut n_captures = 0usize;
         let mut moves_searched = 0;
         let mut legal = 0;
-        let futility_margin = static_eval + 100 + 110 * depth;
+        let futility_margin = static_eval + params::futility_base() + params::futility_per_depth() * depth;
         let lmp_limit = if improving { 4 + 2 * depth * depth } else { 2 + depth * depth };
 
         // The hash move is searched before anything is generated: most nodes cut on it,
@@ -990,11 +991,11 @@ impl Searcher {
                 if depth <= 6 && futility_margin <= alpha {
                     continue;
                 }
-                if depth <= 3 && mscore < -3000 * depth {
+                if depth <= 3 && mscore < -params::history_prune() * depth {
                     continue;
                 }
             }
-            if !root && !pv_node && capture && depth <= 5 && best_score > -MATE_IN_MAX && mscore < (1 << 21) && see(board, mv) < -60 * depth {
+            if !root && !pv_node && capture && depth <= 5 && best_score > -MATE_IN_MAX && mscore < (1 << 21) && see(board, mv) < -params::see_prune() * depth {
                 continue;
             }
 
@@ -1007,7 +1008,7 @@ impl Searcher {
                 && tt_bound != Bound::Upper
                 && tt_score.abs() < MATE_IN_MAX
             {
-                let sbeta = tt_score - 2 * depth;
+                let sbeta = tt_score - params::singular_margin() * depth;
                 let sdepth = (depth - 1) / 2;
                 let s = self.negamax(board, sdepth, ply, sbeta - 1, sbeta, false, false, Some(mv));
                 if self.aborted {
@@ -1051,7 +1052,7 @@ impl Searcher {
                     if !improving {
                         r += 1;
                     }
-                    r -= (mscore / 6000).clamp(-2, 2);
+                    r -= (mscore / params::lmr_history_div()).clamp(-2, 2);
                     r = r.clamp(0, new_depth - 1);
                 }
                 score = -self.negamax(&child, new_depth - r, ply + 1, -alpha - 1, -alpha, false, true, None);
