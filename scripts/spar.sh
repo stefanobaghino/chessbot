@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Self-play A/B match at fixed nodes per move (immune to CPU contention), or timed when
-# TC is set (TC=10+0.1 ...; nodes are then ignored and background cgroups are frozen).
+# TC is set (TC=10+0.1, fastchess syntax: base seconds plus increment seconds, so a
+# Lichess 2+1 is TC=120+1; nodes are then ignored and background cgroups are frozen).
 # Usage: scripts/spar.sh <new_binary> <old_binary> [games] [nodes] [name] [concurrency] [extra -each options]
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
