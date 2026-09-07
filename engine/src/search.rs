@@ -898,6 +898,42 @@ impl Searcher {
             }
         }
 
+        // ProbCut (#32): at a non-PV node deep enough, a capture that still beats beta by a
+        // margin after a quiescence search and a search four plies shallower is taken as a
+        // cutoff. Skipped when the table already proves the score below that margin.
+        if !pv_node && !in_check && excluded.is_none() && depth >= 5 && beta.abs() < MATE_IN_MAX {
+            let pc_beta = beta + 180 - if improving { 40 } else { 0 };
+            let tt_refutes = tt_score != NONE_EVAL && tt_depth >= depth - 3 && tt_score < pc_beta;
+            if !tt_refutes {
+                let mut caps = MoveList::new();
+                gen_moves(board, &mut caps, true, None);
+                self.score_moves(board, &mut caps, None, ply);
+                for i in 0..caps.len {
+                    let (mv, _) = caps.pick(i);
+                    if see(board, mv) < pc_beta - static_eval {
+                        continue;
+                    }
+                    let mut child = board.clone();
+                    child.play_unchecked(mv);
+                    self.hashes.push(child.hash());
+                    self.push_acc(board, mv, ply);
+                    self.ss_piece_to[ply] = Some(piece_index(board, mv.from) * 64 + mv.to as usize);
+                    let mut s = -self.qsearch(&child, ply + 1, -pc_beta, -pc_beta + 1);
+                    if s >= pc_beta && !self.aborted {
+                        s = -self.negamax(&child, depth - 4, ply + 1, -pc_beta, -pc_beta + 1, false, true, None);
+                    }
+                    self.hashes.pop();
+                    if self.aborted {
+                        return 0;
+                    }
+                    if s >= pc_beta {
+                        self.tt.store(hash, Some(mv), tt_score_to(s, ply), raw_eval, depth - 3, Bound::Lower);
+                        return s;
+                    }
+                }
+            }
+        }
+
         if depth >= 4 && tt_move.is_none() && excluded.is_none() {
             depth -= 1;
         }
