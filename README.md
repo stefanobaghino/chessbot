@@ -18,6 +18,9 @@ A chess engine and Lichess bot built to run unattended on a Raspberry Pi 5.
   Draw aversion is rating-based (`CONTEMPT_PER_100`, `CONTEMPT_MAX`): the bot sets the
   engine's `Contempt` option from the two ratings in each game, positive against weaker
   opponents and negative against stronger ones, tapering off as material comes off.
+  Once the tablebase reports a draw the contempt drops to 0, and an opponent's draw
+  offer is accepted when the tablebase proves the draw or the last search saw the bot
+  no better than equal.
 - `bot/` — Python Lichess client (berserk + python-chess) that accepts challenges and
   plays them with the engine. Challenges from an opponent that beat the bot
   `DECLINE_AFTER_LOSSES` times in a row, or rated more than `DECLINE_RATING_GAP` points

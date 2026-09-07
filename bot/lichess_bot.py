@@ -21,6 +21,8 @@ DOTENV_PATH (default: <repo>/.env) without overriding variables already set:
   STALL_ABORT_TIMEOUT  seconds to wait for the opponent's first move before aborting the
                  game (default 120): until both sides have moved the clocks do not run,
                  so a silent opponent would hold the game slot forever. 0 disables
+  Draw offers are accepted when the tablebase reports a draw or our last search saw us
+  no better than equal, and contempt drops to 0 once the tablebase reports a draw.
   HEARTBEAT_INTERVAL  seconds between "alive:" log lines (default 300)
   IDLE_CHALLENGE  1 to challenge an online bot whenever idle (default 0)
   IDLE_CLOCK      clock for those games as seconds+increment (default 300+3), or a
@@ -372,6 +374,7 @@ class Game(threading.Thread):
         self.book = Book(cfg.token, cfg.book_plies, cfg.book_min_games) if cfg.book else None
         self.tablebase = Tablebase(min_clock=cfg.tablebase_min_clock) if cfg.tablebase else None
         self.contempt: int | None = None  # set from the ratings in gameFull, kept across engine respawns
+        self.last_score: int | None = None  # centipawns for our side from our last search, for draw offers (#41)
 
     def run(self) -> None:
         outcome = "finished"
@@ -500,6 +503,26 @@ class Game(threading.Thread):
             log.warning("game %s: abort failed (%s: %s)", self.game_id, type(e).__name__, e)
 
     @staticmethod
+    def draw_offered(state: dict, my_color: chess.Color) -> bool:
+        """True if the opponent's draw offer is pending in this game state."""
+        return bool(state.get("wdraw" if my_color == chess.BLACK else "bdraw"))
+
+    def accepts_draw(self, tb: dict | None) -> bool:
+        """Accept when the tablebase proves the draw, or when our last search saw us no
+        better than equal; a draw offered while we stand better is left alone (#41)."""
+        if tb and tb["category"] == "draw":
+            return True
+        return self.last_score is not None and self.last_score <= 0
+
+    def accept_draw(self) -> bool:
+        try:
+            self.client.bots._r.post(f"/api/bot/game/{self.game_id}/draw/yes")  # berserk 0.14 has no bot draw wrapper
+            return True
+        except Exception as e:  # noqa: BLE001
+            log.warning("game %s: accepting the draw failed (%s: %s), playing on", self.game_id, type(e).__name__, e)
+            return False
+
+    @staticmethod
     def board_from(game_full: dict) -> chess.Board:
         fen = game_full.get("initialFen", "startpos")
         return chess.Board() if fen == "startpos" else chess.Board(fen)
@@ -527,6 +550,16 @@ class Game(threading.Thread):
                 self.send_move(book_move.uci())
                 return engine
         tb = self.tablebase.lookup(board, ours) if self.tablebase is not None else None
+        if tb and tb["category"] == "draw" and self.contempt:
+            # A tablebase draw holds against every opponent the bot meets (#26), so stop
+            # avoiding repetitions and the 50-move rule: take the draw instead (#41).
+            log.info("game %s: tablebase draw, contempt %d -> 0", self.game_id, self.contempt)
+            self.contempt = 0
+        if self.draw_offered(state, my_color) and self.accepts_draw(tb):
+            reason = "tablebase draw" if tb and tb["category"] == "draw" else f"score {self.last_score}"
+            log.info("game %s: accepting the draw offer (%s)", self.game_id, reason)
+            if self.accept_draw():
+                return engine
         if tb and tb["category"] in Tablebase.DECISIVE:
             # Won: the tablebase converts (shortest DTZ, resets the 50-move counter when it
             # can); lost: it resists longest. Either way the engine has nothing to add.
@@ -548,7 +581,8 @@ class Game(threading.Thread):
             try:
                 # With ponder=True python-chess keeps the engine searching the expected reply
                 # after bestmove, sends ponderhit if the opponent plays it, stop otherwise.
-                result = engine.play(board, limit, ponder=self.cfg.ponder and not first, game=self.game_id)
+                result = engine.play(board, limit, ponder=self.cfg.ponder and not first, game=self.game_id,
+                                     info=chess.engine.INFO_SCORE, options={"Contempt": self.contempt or 0})
                 break
             except chess.engine.EngineTerminatedError:
                 log.warning("game %s: engine died during search, re-spawning (attempt %d)", self.game_id, attempt + 1)
@@ -557,6 +591,9 @@ class Game(threading.Thread):
         if result is None or result.move is None:
             return engine
         move = result.move
+        score = result.info.get("score")
+        if score is not None:
+            self.last_score = score.pov(my_color).score(mate_score=100000)
         if tb and tb["category"] == "draw" and not Tablebase.keeps_draw(tb, move):
             # Drawn position: the engine keeps playing for a swindle, but never a losing move.
             tb_move = Tablebase.best_move(board, tb)

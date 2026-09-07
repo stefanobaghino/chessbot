@@ -20,6 +20,9 @@ class FakeBots:
     def resign_game(self, gid):
         self.calls.append(("resign", gid))
 
+    def make_move(self, gid, uci):
+        self.calls.append(("move", gid, uci))
+
 
 def make_bot(timeout=30.0):
     b = Bot.__new__(Bot)
@@ -135,6 +138,10 @@ def test_engine_is_respawned_mid_game():
     import chess
 
     g = Game.__new__(Game)
+    g.contempt = None
+    g.last_score = None
+    g.contempt = None
+    g.last_score = None
     g.game_id = "g1"
     g.book = None
     g.tablebase = None
@@ -154,6 +161,10 @@ def test_maybe_move_ponders_after_the_first_move():
     import chess
 
     g = Game.__new__(Game)
+    g.contempt = None
+    g.last_score = None
+    g.contempt = None
+    g.last_score = None
     g.game_id = "g1"
     g.book = None
     g.tablebase = None
@@ -167,11 +178,12 @@ def test_maybe_move_ponders_after_the_first_move():
     board.push_uci("e2e4")
     board.push_uci("e7e5")
     g.maybe_move(live, board, chess.WHITE, {"wtime": 60000, "btime": 60000})
-    assert [c[1] for c in live.calls] == [{"ponder": False, "game": "g1"}, {"ponder": True, "game": "g1"}]
+    extra = {"info": chess.engine.INFO_SCORE, "options": {"Contempt": 0}}
+    assert [c[1] for c in live.calls] == [{"ponder": False, "game": "g1", **extra}, {"ponder": True, "game": "g1", **extra}]
     assert live.calls[0][0].time == 0.5 and live.calls[1][0].white_clock == 60.0
     g.cfg.ponder = False
     g.maybe_move(live, board, chess.WHITE, {"wtime": 60000, "btime": 60000})
-    assert live.calls[-1][1] == {"ponder": False, "game": "g1"}
+    assert live.calls[-1][1] == {"ponder": False, "game": "g1", **extra}
 
 
 def test_quit_engine_tolerates_dead_engine():
@@ -442,11 +454,14 @@ def test_pause_file_and_sigusr1_block_idle(tmp_path):
 
 def make_game():
     g = Game.__new__(Game)
+    g.contempt = None
+    g.last_score = None
+    g.contempt = None
+    g.last_score = None
     g.game_id = "g1"
     g.my_id = "me"
     g.book = None
     g.tablebase = None
-    g.contempt = None
     g.client = type("Client", (), {})()
     g.client.bots = FakeBots()
     return g
@@ -760,6 +775,10 @@ def test_next_idle_clock_follows_the_weights():
 def test_game_done_records_the_clock():
     b = make_bot()
     g = Game.__new__(Game)
+    g.contempt = None
+    g.last_score = None
+    g.contempt = None
+    g.last_score = None
     g.clock = (120, 1)
     b.games["g1"] = g
     b.game_done("g1")
@@ -771,6 +790,10 @@ def test_game_done_records_the_clock():
 
 def test_game_reads_the_clock_from_gamefull():
     g = Game.__new__(Game)
+    g.contempt = None
+    g.last_score = None
+    g.contempt = None
+    g.last_score = None
     g.my_id = "me"
     g.game_id = "g"
     g.clock = None
@@ -879,6 +902,10 @@ def tb_game(fetch, engine_move):
     import chess
 
     g = Game.__new__(Game)
+    g.contempt = None
+    g.last_score = None
+    g.contempt = None
+    g.last_score = None
     g.game_id = "g1"
     g.book = None
     g.tablebase = None
@@ -1037,3 +1064,43 @@ def test_stall_timer_only_runs_on_the_opponents_first_move():
     assert not t.is_alive() or t.finished.is_set()
     g.cfg.stall_abort_timeout = 0
     assert g.watch_stall(chess.Board(), chess.BLACK, None) is None
+
+
+def test_draw_offer_is_accepted_in_a_tablebase_draw_and_contempt_is_dropped():
+    import chess
+
+    g = make_game()
+    g.cfg = type("Cfg", (), {"ponder": False, "tablebase": True})()
+    g.contempt = 12
+    g.last_score = None
+    posted = []
+    g.client.bots._r = type("R", (), {"post": lambda self, path: posted.append(path)})()
+    g.tablebase = type("TB", (), {"lookup": lambda self, board, clock: {"category": "draw", "moves": []}})()
+    board = chess.Board("8/8/8/4k3/8/8/4K3/4R3 w - - 0 1")
+    engine = LiveEngine()
+    g.maybe_move(engine, board, chess.WHITE, {"wtime": 60000, "btime": 60000, "bdraw": True})
+    assert posted == ["/api/bot/game/g1/draw/yes"]
+    assert g.contempt == 0 and engine.played == 0
+    # Without an offer the game goes on, with the contempt reset passed to the engine.
+    g.maybe_move(engine, board, chess.WHITE, {"wtime": 60000, "btime": 60000})
+    assert engine.played == 1 and engine.calls[-1][1]["options"] == {"Contempt": 0}
+
+
+def test_draw_offer_follows_the_last_score_outside_the_tablebase():
+    import chess
+
+    g = make_game()
+    g.cfg = type("Cfg", (), {"ponder": False, "tablebase": False})()
+    g.contempt = 0
+    posted = []
+    g.client.bots._r = type("R", (), {"post": lambda self, path: posted.append(path)})()
+    board = chess.Board()
+    board.push_uci("e2e4")
+    engine = LiveEngine()
+    g.last_score = 35  # we are better: the offer is ignored and we move
+    g.maybe_move(engine, board, chess.BLACK, {"wtime": 60000, "btime": 60000, "wdraw": True})
+    assert posted == [] and engine.played == 1
+    g.last_score = -20  # we are worse: take it
+    g.maybe_move(engine, board, chess.BLACK, {"wtime": 60000, "btime": 60000, "wdraw": True})
+    assert posted == ["/api/bot/game/g1/draw/yes"] and engine.played == 1
+    assert Game.draw_offered({"bdraw": True}, chess.WHITE) and not Game.draw_offered({"bdraw": True}, chess.BLACK)
