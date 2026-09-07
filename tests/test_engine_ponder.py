@@ -38,3 +38,48 @@ def test_ponderhit_and_ponder_miss():
         assert time.monotonic() - t0 < 2.5
     finally:
         engine.quit()
+
+
+def test_stop_right_after_go_ponder_is_not_lost():
+    """A "stop" sent immediately after "go ponder" (what python-chess does when the opponent
+    replies at once with a move other than the pondered one) must still produce a bestmove.
+    The engine used to clear its stop flag after printing the previous bestmove, which could
+    wipe out that stop and leave the ponder search running forever."""
+    import subprocess
+
+    # Sharing one core with the engine makes the race likely: the engine's search thread is
+    # preempted between printing bestmove and its next step while we react to the bestmove.
+    try:
+        os.sched_setaffinity(0, {min(os.sched_getaffinity(0))})
+    except (AttributeError, OSError):
+        pass
+    p = subprocess.Popen([str(ENGINE)], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True, bufsize=1)
+
+    def send(s):
+        p.stdin.write(s + "\n")
+        p.stdin.flush()
+
+    def wait_for(prefix, timeout):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            line = p.stdout.readline()
+            if not line or line.startswith(prefix):
+                return line
+        return None
+
+    try:
+        send("uci")
+        assert wait_for("uciok", 5)
+        moves = "e2e4 e7e5"
+        for _ in range(8):
+            send(f"position startpos moves {moves}")
+            send("go wtime 200 btime 200 winc 10 binc 10")
+            bm = wait_for("bestmove", 5)
+            assert bm and bm.split()[1] != "0000"
+            # The pondered position, then "stop" in the very same write as "go ponder".
+            send(f"position startpos moves {moves} {bm.split()[1]} {bm.split()[3]}\ngo ponder wtime 200 btime 200 winc 10 binc 10\nstop")
+            assert wait_for("bestmove", 3), "engine kept pondering after stop"
+        send("quit")
+        assert p.wait(timeout=5) == 0
+    finally:
+        p.kill()

@@ -189,7 +189,9 @@ fn search_thread(rx: mpsc::Receiver<Cmd>, stop: Arc<AtomicBool>, ponder: Arc<Ato
                     None => println!("bestmove 0000"),
                 }
                 io::stdout().flush().ok();
-                stop.store(false, Ordering::Relaxed);
+                // The stop flag is cleared by the reader on the next "go", never here: a
+                // "stop" that arrives right after that "go" would otherwise be wiped out
+                // and leave a "go ponder" searching forever (the bot then hangs mid-game).
             }
             Cmd::Bench(depth) => {
                 let fens = [
