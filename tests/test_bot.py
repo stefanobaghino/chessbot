@@ -996,3 +996,44 @@ def test_tablebase_is_skipped_when_it_does_not_apply():
     g.maybe_move(engine, chess.Board("8/8/8/8/8/3k4/4p3/4K3 w - - 0 1"), chess.WHITE, {"wtime": 60000, "btime": 60000})
     assert calls == [] and engine.played == 1
     Tablebase.disabled_until = 0.0
+
+
+def test_silent_opponent_is_aborted_before_the_clocks_start():
+    g = make_game()
+    g.cfg = type("Cfg", (), {"contempt_per_100": 0.0, "contempt_max": 0, "ponder": False, "tablebase": False, "stall_abort_timeout": 0.05})()
+    g.contempt = 0
+    g.quit_engine = lambda e: None
+    aborted = threading.Event()
+
+    class Bots(FakeBots):
+        def stream_game_state(self, gid):
+            # We are white and have played e4; the opponent never answers.
+            yield {"type": "gameFull", "white": {"id": "me"}, "black": {"id": "opp", "name": "opp"},
+                   "state": {"moves": "e2e4", "status": "started"}}
+            assert aborted.wait(2), "the stall timer did not fire"
+            yield {"type": "gameState", "moves": "e2e4", "status": "aborted"}
+
+        def abort_game(self, gid):
+            self.calls.append(("abort", gid))
+            aborted.set()
+
+    g.client.bots = Bots()
+    g.play_stream(None)
+    assert ("abort", "g1") in g.client.bots.calls
+
+
+def test_stall_timer_only_runs_on_the_opponents_first_move():
+    import chess
+
+    g = make_game()
+    g.cfg = type("Cfg", (), {"stall_abort_timeout": 60.0})()
+    board = chess.Board()
+    assert g.watch_stall(board, chess.WHITE, None) is None  # our move: nothing to wait for
+    t = g.watch_stall(board, chess.BLACK, None)  # white (the opponent) has not opened yet
+    assert t is not None
+    board.push_uci("e2e4")
+    board.push_uci("e7e5")
+    assert g.watch_stall(board, chess.WHITE, t) is None  # both moved, clocks run: timer cancelled
+    assert not t.is_alive() or t.finished.is_set()
+    g.cfg.stall_abort_timeout = 0
+    assert g.watch_stall(chess.Board(), chess.BLACK, None) is None

@@ -18,6 +18,9 @@ DOTENV_PATH (default: <repo>/.env) without overriding variables already set:
   STREAM_READ_TIMEOUT  seconds without any byte from the Lichess event stream (it sends
                  keep-alives every few seconds) before the stream is considered wedged
                  and reconnected (default 90)
+  STALL_ABORT_TIMEOUT  seconds to wait for the opponent's first move before aborting the
+                 game (default 120): until both sides have moved the clocks do not run,
+                 so a silent opponent would hold the game slot forever. 0 disables
   HEARTBEAT_INTERVAL  seconds between "alive:" log lines (default 300)
   IDLE_CHALLENGE  1 to challenge an online bot whenever idle (default 0)
   IDLE_CLOCK      clock for those games as seconds+increment (default 300+3), or a
@@ -139,6 +142,7 @@ class Config:
         self.max_games = int(os.environ.get("MAX_GAMES", "1"))
         self.shutdown_timeout = float(os.environ.get("SHUTDOWN_TIMEOUT", "900"))
         self.stream_read_timeout = float(os.environ.get("STREAM_READ_TIMEOUT", "90"))
+        self.stall_abort_timeout = float(os.environ.get("STALL_ABORT_TIMEOUT", "120"))
         self.login_timeout = float(os.environ.get("LOGIN_TIMEOUT", "300"))
         self.heartbeat_interval = float(os.environ.get("HEARTBEAT_INTERVAL", "300"))
         self.idle_challenge = os.environ.get("IDLE_CHALLENGE", "0") == "1"
@@ -452,21 +456,48 @@ class Game(threading.Thread):
         if first["state"].get("status", "started") != "started":
             log.info("game %s: already over (%s)", self.game_id, first["state"].get("status"))
             return engine
-        engine = self.maybe_move(engine, board, my_color, first["state"])
-        for event in stream:
-            kind = event.get("type")
-            if kind == "gameState":
-                board = self.board_from(first)
-                self.apply_state(board, event)
-                if event.get("status") != "started":
-                    winner = event.get("winner")
-                    result = "draw" if not winner else ("win" if (winner == "white") == my_color else "loss")
-                    log.info("game %s: over (%s) result=%s vs %s", self.game_id, event.get("status"), result, opponent)
-                    break
-                engine = self.maybe_move(engine, board, my_color, event)
-            elif kind == "chatLine" or kind == "opponentGone":
-                continue
+        timer = self.watch_stall(board, my_color, None)
+        try:
+            engine = self.maybe_move(engine, board, my_color, first["state"])
+            for event in stream:
+                kind = event.get("type")
+                if kind == "gameState":
+                    board = self.board_from(first)
+                    self.apply_state(board, event)
+                    if event.get("status") != "started":
+                        winner = event.get("winner")
+                        result = "draw" if not winner else ("win" if (winner == "white") == my_color else "loss")
+                        log.info("game %s: over (%s) result=%s vs %s", self.game_id, event.get("status"), result, opponent)
+                        break
+                    timer = self.watch_stall(board, my_color, timer)
+                    engine = self.maybe_move(engine, board, my_color, event)
+                elif kind == "chatLine" or kind == "opponentGone":
+                    continue
+        finally:
+            if timer is not None:
+                timer.cancel()
         return engine
+
+    def watch_stall(self, board: chess.Board, my_color: chess.Color, timer: threading.Timer | None) -> threading.Timer | None:
+        """Arms a timer that aborts the game if the opponent does not play their first move
+        within STALL_ABORT_TIMEOUT (#40). Until both sides have moved the clocks do not run,
+        so Lichess never flags a silent opponent and the game would hold our slot forever;
+        once the clocks run, a stalled opponent flags by itself. Cancels the previous timer."""
+        if timer is not None:
+            timer.cancel()
+        if len(board.move_stack) >= 2 or board.turn == my_color or self.cfg.stall_abort_timeout <= 0 or board.is_game_over():
+            return None
+        t = threading.Timer(self.cfg.stall_abort_timeout, self.abort_stalled, args=(len(board.move_stack),))
+        t.daemon = True
+        t.start()
+        return t
+
+    def abort_stalled(self, plies: int) -> None:
+        log.warning("game %s: no move from the opponent after %.0fs at ply %d, aborting", self.game_id, self.cfg.stall_abort_timeout, plies)
+        try:
+            self.client.bots.abort_game(self.game_id)
+        except Exception as e:  # noqa: BLE001
+            log.warning("game %s: abort failed (%s: %s)", self.game_id, type(e).__name__, e)
 
     @staticmethod
     def board_from(game_full: dict) -> chess.Board:
