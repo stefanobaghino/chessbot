@@ -67,6 +67,11 @@ const NONE_EVAL: i32 = -INF - 1;
 const HIST_MAX: i32 = 16384;
 const CONT_TABLES: usize = 2;
 const PIECE_TO: usize = 12 * 64;
+/// Correction history (#29): running error of the static evaluation, indexed by pawn
+/// structure, by material and by the previous move, in units of a 256th of a centipawn.
+const CORR_SIZE: usize = 16384;
+const CORR_GRAIN: i32 = 256;
+const CORR_MAX: i32 = 64 * CORR_GRAIN;
 
 pub struct Searcher {
     pub tt: Arc<TranspositionTable>,
@@ -107,6 +112,9 @@ pub struct Searcher {
     node_limit: Option<u64>,
     aborted: bool,
     lmr: [[i32; 64]; 64],
+    corr_pawn: Box<[[i32; CORR_SIZE]; 2]>,
+    corr_material: Box<[[i32; CORR_SIZE]; 2]>,
+    corr_cont: Box<[[i32; PIECE_TO]; 2]>,
     /// Quiet moves and captures tried at each ply of the current line, see `negamax`.
     tried_quiets: Box<[[Move; 256]]>,
     tried_captures: Box<[[(Move, Piece); 256]]>,
@@ -296,6 +304,9 @@ impl Searcher {
             node_limit: None,
             aborted: false,
             lmr,
+            corr_pawn: Box::new([[0; CORR_SIZE]; 2]),
+            corr_material: Box::new([[0; CORR_SIZE]; 2]),
+            corr_cont: Box::new([[0; PIECE_TO]; 2]),
             tried_quiets: vec![[NULL_MOVE; 256]; MAX_PLY].into_boxed_slice(),
             tried_captures: vec![[(NULL_MOVE, Piece::Pawn); 256]; MAX_PLY].into_boxed_slice(),
         }
@@ -313,6 +324,61 @@ impl Searcher {
         match (&self.net, self.use_nnue) {
             (Some(net), true) => net.evaluate(&self.accs[ply], board.side_to_move()),
             _ => eval::evaluate(&self.tables, board),
+        }
+    }
+
+    #[inline]
+    fn mix(mut x: u64) -> u64 {
+        x ^= x >> 33;
+        x = x.wrapping_mul(0xff51_afd7_ed55_8ccd);
+        x ^= x >> 33;
+        x = x.wrapping_mul(0xc4ce_b9fe_1a85_ec53);
+        x ^ (x >> 33)
+    }
+
+    /// Indices into the correction tables: pawn structure and material of the position,
+    /// plus the piece-to square of the previous move.
+    fn corr_keys(&self, board: &Board, ply: usize) -> (usize, usize, Option<usize>) {
+        let white = board.colors(Color::White);
+        let pawns = board.pieces(Piece::Pawn);
+        let pawn_key = Self::mix((pawns & white).0 ^ Self::mix((pawns & !white).0).rotate_left(17));
+        let mut material = 0u64;
+        for (i, piece) in Piece::ALL.iter().enumerate() {
+            let bb = board.pieces(*piece);
+            material |= ((bb & white).len() as u64) << (i * 8);
+            material |= ((bb & !white).len() as u64) << (i * 8 + 4);
+        }
+        let prev = if ply >= 1 { self.ss_piece_to[ply - 1] } else { None };
+        (pawn_key as usize % CORR_SIZE, Self::mix(material) as usize % CORR_SIZE, prev)
+    }
+
+    /// The static evaluation adjusted by the correction history of the position.
+    fn corrected_eval(&self, board: &Board, raw: i32, ply: usize) -> i32 {
+        let stm = board.side_to_move() as usize;
+        let (pk, mk, prev) = self.corr_keys(board, ply);
+        let mut sum = self.corr_pawn[stm][pk] + self.corr_material[stm][mk];
+        let mut n = 2;
+        if let Some(p) = prev {
+            sum += self.corr_cont[stm][p];
+            n += 1;
+        }
+        (raw + sum / (n * CORR_GRAIN)).clamp(-MATE_IN_MAX + 1, MATE_IN_MAX - 1)
+    }
+
+    /// Moves each correction entry towards the error the search just measured, weighted
+    /// by depth (the wiki's exponential moving average form).
+    fn update_correction(&mut self, board: &Board, ply: usize, raw: i32, score: i32, depth: i32) {
+        let stm = board.side_to_move() as usize;
+        let (pk, mk, prev) = self.corr_keys(board, ply);
+        let diff = ((score - raw) * CORR_GRAIN).clamp(-CORR_MAX, CORR_MAX);
+        let w = (depth + 1).min(16);
+        let blend = |e: &mut i32| {
+            *e = ((*e * (256 - w) + diff * w) / 256).clamp(-CORR_MAX, CORR_MAX);
+        };
+        blend(&mut self.corr_pawn[stm][pk]);
+        blend(&mut self.corr_material[stm][mk]);
+        if let Some(p) = prev {
+            blend(&mut self.corr_cont[stm][p]);
         }
     }
 
@@ -340,6 +406,12 @@ impl Searcher {
         self.history = [[[0; 64]; 64]; 2];
         for v in self.cont_hist.iter_mut() {
             *v = 0;
+        }
+        for t in self.corr_pawn.iter_mut().chain(self.corr_material.iter_mut()) {
+            *t = [0; CORR_SIZE];
+        }
+        for t in self.corr_cont.iter_mut() {
+            *t = [0; PIECE_TO];
         }
         for v in self.capt_hist.iter_mut() {
             *v = 0;
@@ -776,13 +848,14 @@ impl Searcher {
         }
 
         let raw_eval = if in_check { NONE_EVAL } else { tt_eval.unwrap_or_else(|| self.eval_at(board, ply)) };
-        self.ss_eval[ply] = raw_eval;
-        let mut static_eval = raw_eval;
+        let corrected = if in_check { NONE_EVAL } else { self.corrected_eval(board, raw_eval, ply) };
+        self.ss_eval[ply] = corrected;
+        let mut static_eval = corrected;
         if !in_check && tt_score != NONE_EVAL {
             let usable = match tt_bound {
                 Bound::Exact => true,
-                Bound::Lower => tt_score > raw_eval,
-                Bound::Upper => tt_score < raw_eval,
+                Bound::Lower => tt_score > corrected,
+                Bound::Upper => tt_score < corrected,
                 Bound::None => false,
             };
             if usable {
@@ -790,7 +863,7 @@ impl Searcher {
             }
         }
         let improving = !in_check
-            && (ply < 2 || self.ss_eval[ply - 2] == NONE_EVAL || raw_eval > self.ss_eval[ply - 2]);
+            && (ply < 2 || self.ss_eval[ply - 2] == NONE_EVAL || corrected > self.ss_eval[ply - 2]);
 
         let stm = board.side_to_move();
 
@@ -1020,6 +1093,19 @@ impl Searcher {
                 Bound::Upper
             };
             self.tt.store(hash, best_move, tt_score_to(best_score, ply), if in_check { 0 } else { raw_eval }, depth, bound);
+            // Correction history learns from nodes whose result is a quiet evaluation of the
+            // position: not in check, no capture as the best move, and a score that is a
+            // usable bound relative to the static evaluation.
+            let quiet_best = best_move.is_none_or(|m| captured_piece(board, m).is_none() && m.promotion.is_none());
+            let usable = match bound {
+                Bound::Exact => true,
+                Bound::Lower => best_score > corrected,
+                Bound::Upper => best_score < corrected,
+                Bound::None => false,
+            };
+            if !in_check && quiet_best && usable && best_score.abs() < MATE_IN_MAX {
+                self.update_correction(board, ply, raw_eval, best_score, depth);
+            }
         }
         best_score
     }
@@ -1054,11 +1140,13 @@ impl Searcher {
 
         let mut best_score;
         let static_eval;
+        let mut raw_eval = 0;
         if in_check {
             best_score = -INF;
             static_eval = 0;
         } else {
-            static_eval = tt_eval.unwrap_or_else(|| self.eval_at(board, ply));
+            raw_eval = tt_eval.unwrap_or_else(|| self.eval_at(board, ply));
+            static_eval = self.corrected_eval(board, raw_eval, ply);
             best_score = static_eval;
             if best_score >= beta {
                 return best_score;
@@ -1113,7 +1201,7 @@ impl Searcher {
         } else {
             Bound::Upper
         };
-        self.tt.store(hash, best_move, tt_score_to(best_score, ply), static_eval, 0, bound);
+        self.tt.store(hash, best_move, tt_score_to(best_score, ply), raw_eval, 0, bound);
         best_score
     }
 }
@@ -1219,6 +1307,25 @@ mod tests {
         // The same clock with an increment keeps the old budget.
         s.set_limits(&board, &Limits { wtime: Some(60000), winc: Some(1000), ..Default::default() });
         assert_eq!(s.soft_limit.unwrap().as_millis(), 59700 / 24 + 750);
+    }
+
+    #[test]
+    fn correction_history_moves_the_static_eval_towards_search_results() {
+        let mut s = searcher();
+        let board = Board::default();
+        let raw = s.static_eval(&board);
+        assert_eq!(s.corrected_eval(&board, raw, 0), raw);
+        for _ in 0..8 {
+            s.update_correction(&board, 0, raw, raw + 80, 8);
+        }
+        let corrected = s.corrected_eval(&board, raw, 0);
+        assert!(corrected > raw + 10 && corrected <= raw + 80, "raw {raw} corrected {corrected}");
+        // A different pawn structure shares nothing with the start position's entry.
+        let other = Board::from_fen("rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b KQkq - 0 1", false).unwrap();
+        let raw_other = s.static_eval(&other);
+        assert_eq!(s.corrected_eval(&other, raw_other, 0), raw_other);
+        s.new_game_local();
+        assert_eq!(s.corrected_eval(&board, raw, 0), raw);
     }
 
     #[test]
