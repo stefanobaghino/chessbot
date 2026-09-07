@@ -33,7 +33,7 @@ fi
 nice taskset -c "$SPAR_CPUS" fastchess \
   -engine cmd="$NEW" name=new \
   -engine cmd="$OLD" name=old \
-  -each $LIMIT option.Hash=32 option.Threads=1 $EXTRA \
+  -each $LIMIT option.Hash=${HASH:-32} option.Threads=1 $EXTRA \
   -openings file="$BOOK" format=epd order=random \
   -rounds "$ROUNDS" -games 2 -repeat -concurrency "$CONC" \
   -pgnout file="$OUT.pgn" -ratinginterval 20 -report penta=false \
