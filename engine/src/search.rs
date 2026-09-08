@@ -271,7 +271,10 @@ impl Searcher {
                 lmr[d][m] = (0.75 + (d as f64).ln() * (m as f64).ln() / 2.25) as i32;
             }
         }
-        let net = Network::load_default();
+        let net = Network::load_default().unwrap_or_else(|e| {
+            eprintln!("info string {}", e);
+            None
+        });
         let use_nnue = net.is_some();
         Searcher {
             tt,
@@ -315,7 +318,7 @@ impl Searcher {
 
     pub fn static_eval(&self, board: &Board) -> i32 {
         match (&self.net, self.use_nnue) {
-            (Some(net), true) => net.evaluate(&net.refresh(board), board.side_to_move()),
+            (Some(net), true) => net.evaluate(&net.refresh(board), board.side_to_move(), board.occupied().len() as usize),
             _ => eval::evaluate(&self.tables, board),
         }
     }
@@ -323,7 +326,7 @@ impl Searcher {
     #[inline]
     fn eval_at(&self, board: &Board, ply: usize) -> i32 {
         match (&self.net, self.use_nnue) {
-            (Some(net), true) => net.evaluate(&self.accs[ply], board.side_to_move()),
+            (Some(net), true) => net.evaluate(&self.accs[ply], board.side_to_move(), board.occupied().len() as usize),
             _ => eval::evaluate(&self.tables, board),
         }
     }

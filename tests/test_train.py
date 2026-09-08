@@ -71,3 +71,42 @@ def test_window_allows_uses_the_epoch_estimate() -> None:
     assert not train.window_allows((9, 21), 0, dt.datetime(2026, 9, 5, 8, 59).astimezone())
     assert train.parse_window(None) is None
     assert train.parse_window("9-21") == (9, 21)
+
+
+def test_feature_indexing_matches_the_engine() -> None:
+    """The same cases are pinned in engine/src/nnue.rs (feature_index_matches_trainer)."""
+    # Square numbering: a1 = 0 .. h8 = 63; codes: white P..K = 1..6, black = 7..12.
+    def row(placements: dict[int, int]) -> np.ndarray:
+        p = np.zeros(64, dtype=np.uint8)
+        for sq, code in placements.items():
+            p[sq] = code
+        return p
+
+    g1, f3, e8, d1, c2, a7, h4, e1 = 6, 21, 60, 3, 10, 48, 31, 4
+    pieces = np.stack([
+        row({g1: 6, f3: 2, e8: 12}),  # white to move, white king g1, knight f3
+        row({e8: 12, d1: 5, e1: 6}),  # black to move, black king e8, white queen d1
+        row({c2: 6, a7: 7, e8: 12}),  # white to move, white king c2, black pawn a7
+        row({h4: 12, e1: 6}),  # black to move, black king h4
+    ])
+    stm = np.array([0, 1, 0, 1], dtype=np.uint8)
+    us_i, us_o, _, _, ob = train.features(pieces, stm)
+    us = [set(us_i[us_o[i] : (us_o[i + 1] if i + 1 < len(us_o) else len(us_i))].tolist()) for i in range(4)]
+    assert 64 + 18 in us[0]
+    assert 768 + 384 + 256 + 60 in us[1]
+    assert 2 * 768 + 384 + 48 in us[2]
+    assert 3 * 768 + 320 + 32 in us[3]
+    assert ob.tolist() == [0, 0, 0, 0]
+    full = np.zeros((1, 64), dtype=np.uint8)
+    full[0, :32] = np.array([1, 2, 3, 4, 5, 6, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1] + [7, 8, 9, 10, 11, 12, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7])
+    assert train.features(full, np.zeros(1, dtype=np.uint8))[4].tolist() == [3]
+
+
+def test_export_writes_the_versioned_header(tmp_path: Path) -> None:
+    net = train.Net(8)
+    out = tmp_path / "n.bin"
+    train.export(net, str(out))
+    raw = out.read_bytes()
+    assert np.frombuffer(raw[:16], dtype=np.int32).tolist() == [train.FORMAT, 8, train.KING_BUCKETS, train.OUT_BUCKETS]
+    rows = train.KING_BUCKETS * 768
+    assert len(raw) == 16 + 2 * (rows * 8 + 8 + train.OUT_BUCKETS * 16) + 4 * train.OUT_BUCKETS

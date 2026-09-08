@@ -73,7 +73,14 @@ that have not been labelled yet. `train/train.py` saves its full state to `<out>
 every epoch and resumes from it when run again with the same arguments; with `--window 9-21`
 it exits with status 3 instead of starting an epoch that would end after 21:00.
 `scripts/train_net6.sh` is the net6 job built on both: a no-op until every relabel chunk
-exists, otherwise it trains (or resumes) inside the window.
+exists, otherwise it trains (or resumes) inside the window. `scripts/train_net7.sh` trains
+net7, the first bucketed net, on the same data.
+
+The network is `(4x768 -> 384)x2 -> 4`: each perspective indexes its features by its own
+king's bucket (back-rank corners, back-rank centre, second rank, elsewhere; files e-h are
+mirrored onto a-d), and the output layer is picked by piece count in four bands. The file
+header (format, hidden, king buckets, out buckets) is checked when the net is embedded, so
+`validate.sh`'s self-check fails on a net built for another layout.
 `scripts/install_timers.sh` installs both as persistent daily user timers (09:00 and 09:05,
 `CPUQuota=200%`, i.e. half of the four cores) that survive a reboot; `--uninstall` removes them.
 
