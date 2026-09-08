@@ -77,6 +77,8 @@ exists, otherwise it trains (or resumes) inside the window.
 `scripts/install_timers.sh` installs both as persistent daily user timers (09:00 and 09:05,
 `CPUQuota=200%`, i.e. half of the four cores) that survive a reboot; `--uninstall` removes them.
 
+`scripts/sparsum.py matches/<a>.log matches/<b>.log` sums the batches of a gate that spans
+several `spar.sh` runs into one score, Elo and 95 percent error.
 `scripts/blunders.py matches/<run>.pgn` lists the moves that lost the most in each
 lost game, `scripts/evalsym.py` checks that the static evaluation is colour-symmetric.
 
