@@ -7,7 +7,9 @@
 use cozy_chess::{Board, Color, File, Move, Piece, Square};
 
 pub const HIDDEN: usize = 384;
+/// 1 disables king buckets and mirroring; the trainer's --king-buckets must match.
 pub const KING_BUCKETS: usize = 4;
+/// 1 to 4 bands of piece count; the trainer's --out-buckets must match.
 pub const OUT_BUCKETS: usize = 4;
 /// File format version; the header is FORMAT, HIDDEN, KING_BUCKETS, OUT_BUCKETS as i32.
 const FORMAT: i32 = 2;
@@ -144,6 +146,9 @@ impl Network {
 
     #[inline]
     fn key(persp: Color, king: Square) -> Key {
+        if KING_BUCKETS == 1 {
+            return Key { base: 0, mirror: false };
+        }
         let rel = if persp == Color::White { king as usize } else { king as usize ^ 56 };
         Key { base: KING_BUCKET[rel] as usize * FEATURES, mirror: rel & 7 >= 4 }
     }

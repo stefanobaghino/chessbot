@@ -28,8 +28,8 @@ SCALE = 400.0
 QA = 255
 QB = 64
 FORMAT = 2
-KING_BUCKETS = 4
-OUT_BUCKETS = 4
+KING_BUCKETS = 4  # overridden by --king-buckets; 1 disables king buckets and mirroring
+OUT_BUCKETS = 4  # overridden by --out-buckets
 KING_BUCKET = np.array([0, 0, 1, 1, 1, 1, 0, 0] + [2] * 8 + [3] * 48, dtype=np.int64)
 WHITE_KING, BLACK_KING = 6, 12  # piece codes in the npz files
 
@@ -65,6 +65,8 @@ def perspective(rel_king: np.ndarray, rel_color: np.ndarray, ptype: np.ndarray, 
     rel_color is 0 for the perspective's own pieces; squares are already flipped for the
     black perspective and get mirrored (file ^ 7) when the king stands on files e-h.
     """
+    if KING_BUCKETS == 1:
+        return rel_color * 384 + ptype * 64 + rel_sq
     mirror = np.where((rel_king & 7) >= 4, 7, 0)[:, None]
     return KING_BUCKET[rel_king][:, None] * 768 + rel_color * 384 + ptype * 64 + (rel_sq ^ mirror)
 
@@ -131,6 +133,7 @@ def window_allows(window: tuple[int, int], est_seconds: float, now: dt.datetime 
 
 
 def main():
+    global KING_BUCKETS, OUT_BUCKETS
     ap = argparse.ArgumentParser()
     ap.add_argument("data", help="comma-separated list of .npz files")
     ap.add_argument("out")
@@ -143,7 +146,11 @@ def main():
     ap.add_argument("--limit", type=int, default=0)
     ap.add_argument("--checkpoint", default=None, help="full-state checkpoint, default <out>.ckpt")
     ap.add_argument("--window", default=None, help="hours H1-H2 inside which epochs may run, e.g. 9-21")
+    ap.add_argument("--holdout", default=None, help="npz never used for training; its loss is reported and the export keeps the best epoch")
+    ap.add_argument("--king-buckets", type=int, default=KING_BUCKETS, help="1 or 4; the engine must be built with the same value")
+    ap.add_argument("--out-buckets", type=int, default=OUT_BUCKETS, help="1 to 4; the engine must be built with the same value")
     args = ap.parse_args()
+    KING_BUCKETS, OUT_BUCKETS = args.king_buckets, args.out_buckets
     ckpt_path = args.checkpoint or args.out + ".ckpt"
     window = parse_window(args.window)
     torch.set_num_threads(args.threads)
@@ -163,13 +170,14 @@ def main():
     val_idx, train_idx = perm[:n_val], perm[n_val:]
     print(f"{len(train_idx)} train / {n_val} val positions")
 
+    holdout = np.load(args.holdout) if args.holdout else None
     net = Net(args.hidden)
     if args.resume:
         net.load_state_dict(torch.load(args.resume))
     opt = torch.optim.Adam(net.parameters(), lr=args.lr)
     sched = torch.optim.lr_scheduler.StepLR(opt, step_size=max(1, args.epochs // 3), gamma=0.3)
-    first_epoch, est = 0, 0.0
-    key = {"data": args.data, "hidden": args.hidden, "epochs": args.epochs, "n": n,
+    first_epoch, est, best = 0, 0.0, float("inf")
+    key = {"data": args.data, "hidden": args.hidden, "epochs": args.epochs, "n": n, "holdout": args.holdout,
            "format": FORMAT, "king_buckets": KING_BUCKETS, "out_buckets": OUT_BUCKETS}
     if os.path.exists(ckpt_path):
         ck = torch.load(ckpt_path, weights_only=False)
@@ -180,17 +188,26 @@ def main():
         sched.load_state_dict(ck["sched"])
         rng.bit_generator.state = ck["rng"]
         train_idx = ck["train_idx"]
-        first_epoch, est = ck["epoch"], ck["epoch_seconds"]
+        first_epoch, est, best = ck["epoch"], ck["epoch_seconds"], ck.get("best", float("inf"))
         print(f"resumed from {ckpt_path} after epoch {first_epoch}/{args.epochs}", flush=True)
         if first_epoch >= args.epochs:
             print("nothing left to do", flush=True)
             return
 
-    def batch_loss(idx):
-        us_i, us_o, th_i, th_o, ob = features(pieces[idx], stm[idx])
-        target = torch.sigmoid(torch.from_numpy(score[idx]) / SCALE)
+    def batch_loss(idx, data=(pieces, stm, score)):
+        p, s, sc = data
+        us_i, us_o, th_i, th_o, ob = features(p[idx], s[idx])
+        target = torch.sigmoid(torch.from_numpy(sc[idx].astype(np.float32)) / SCALE)
         pred = torch.sigmoid(net(us_i, us_o, th_i, th_o, ob))
         return ((pred - target) ** 2).mean()
+
+    def holdout_loss():
+        if holdout is None:
+            return None
+        h = (holdout["pieces"], holdout["stm"], holdout["score"])
+        m = len(h[2])
+        with torch.no_grad():
+            return np.mean([batch_loss(np.arange(s, min(s + args.batch, m)), h).item() for s in range(0, m, args.batch)])
 
     for epoch in range(first_epoch, args.epochs):
         if window and not window_allows(window, est):
@@ -213,11 +230,16 @@ def main():
         net.eval()
         with torch.no_grad():
             vl = np.mean([batch_loss(np.sort(val_idx[s : s + args.batch])).item() for s in range(0, n_val, args.batch)])
-        print(f"epoch {epoch + 1}/{args.epochs} train {total / nb:.5f} val {vl:.5f} lr {sched.get_last_lr()[0]:.1e} {time.time() - t0:.0f}s", flush=True)
-        torch.save(net.state_dict(), args.out + ".pt")
-        export(net, args.out)
+        hl = holdout_loss()
+        extra = f" holdout {hl:.5f}" if hl is not None else ""
+        print(f"epoch {epoch + 1}/{args.epochs} train {total / nb:.5f} val {vl:.5f}{extra} lr {sched.get_last_lr()[0]:.1e} {time.time() - t0:.0f}s", flush=True)
+        # Without a holdout every epoch is exported; with one, only epochs that improve on it.
+        if hl is None or hl < best:
+            best = hl if hl is not None else best
+            torch.save(net.state_dict(), args.out + ".pt")
+            export(net, args.out)
         est = time.time() - t0
-        state = {"key": key, "epoch": epoch + 1, "epoch_seconds": est, "net": net.state_dict(),
+        state = {"key": key, "epoch": epoch + 1, "epoch_seconds": est, "best": best, "net": net.state_dict(),
                  "opt": opt.state_dict(), "sched": sched.state_dict(), "rng": rng.bit_generator.state,
                  "train_idx": train_idx}
         torch.save(state, ckpt_path + ".tmp")
