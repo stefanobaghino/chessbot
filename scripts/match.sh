@@ -13,6 +13,11 @@ BOOK="$HOME/tools/books/UHO_Lichess_4852_v1.epd"
 OUT="$ROOT/matches/${NAME}_sf${ELO}_${GAMES}g"
 ROUNDS=$(( (GAMES + 1) / 2 ))
 export PATH="$HOME/.local/bin:$PATH"
+# One job at a time on the sparring cores (see queue.sh); queued jobs already hold it.
+if [ -z "${CORES_LOCKED:-}" ]; then
+  exec 9>"$ROOT/matches/.cores23.lock"
+  flock -n 9 || { echo "$(basename "$0"): waiting for the cores lock held by another job"; flock 9; }
+fi
 # Keep off the live bot's cores (0-1); see README "Sharing the machine with the live bot".
 SPAR_CPUS="${SPAR_CPUS:-2-3}"
 # Timed games are sensitive to contention: pause background jobs sharing the sparring cores.

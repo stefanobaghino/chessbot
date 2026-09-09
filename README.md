@@ -95,10 +95,15 @@ with a timed `TC=10+0.1 scripts/spar.sh` before changing the defaults.
 
 ### Sharing the machine with the live bot
 
-The live bot is not pinned: its systemd unit runs on all four cores unless the operator
-pins it for a measurement window (see #49). `spar.sh`
+The live bot is pinned to cores 0-1 (`CPUAffinity=0-1` in its systemd unit, see #49). `spar.sh`
 and `match.sh` pin their games to cores 2-3 with `taskset` (override with `SPAR_CPUS`);
 sparring engines alternate moves, so two concurrent games fill the two cores.
 Background jobs go into cgroups created once per boot with `sudo scripts/cgroups.sh`:
 `quiet` (one core) for relabelling and data generation, `train` (two cores) for
 training, both restricted to cores 2-3. `match.sh` freezes them while timed games run.
+
+`spar.sh` and `match.sh` take a lock (`matches/.cores23.lock`) so that two jobs never
+share cores 2-3 at once. `scripts/queue.sh [--window] [--est MINUTES] [--name NAME] --
+<command>` runs any job behind that lock and, with `--window`, waits for the next 09:00
+from which its estimated duration ends before 21:00 (a job queued at 18:30 for tomorrow
+therefore starts tomorrow, not now). Starts, ends and exit codes go to `matches/queue.log`.
