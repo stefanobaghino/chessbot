@@ -95,7 +95,8 @@ with a timed `TC=10+0.1 scripts/spar.sh` before changing the defaults.
 
 ### Sharing the machine with the live bot
 
-The Lichess bot runs on cores 0-1 (`CPUAffinity=0 1` in its systemd unit). `spar.sh`
+The live bot is not pinned: its systemd unit runs on all four cores unless the operator
+pins it for a measurement window (see #49). `spar.sh`
 and `match.sh` pin their games to cores 2-3 with `taskset` (override with `SPAR_CPUS`);
 sparring engines alternate moves, so two concurrent games fill the two cores.
 Background jobs go into cgroups created once per boot with `sudo scripts/cgroups.sh`:

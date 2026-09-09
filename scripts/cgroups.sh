@@ -7,7 +7,7 @@
 #
 # Moving a process in still needs root (sudo sh -c "echo $$ > /sys/fs/cgroup/quiet/cgroup.procs")
 # but the owner can freeze/thaw the groups. Matches use taskset instead (scripts/spar.sh).
-# The live bot is pinned to cores 0-1 by CPUAffinity in its systemd unit.
+# The live bot is not pinned (its unit runs on all cores unless the operator pins it, see #49).
 set -euo pipefail
 OWNER="${1:-${SUDO_USER:-$USER}}"
 ROOT=/sys/fs/cgroup
