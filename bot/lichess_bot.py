@@ -18,6 +18,9 @@ DOTENV_PATH (default: <repo>/.env) without overriding variables already set:
   STREAM_READ_TIMEOUT  seconds without any byte from the Lichess event stream (it sends
                  keep-alives every few seconds) before the stream is considered wedged
                  and reconnected (default 90)
+  STREAM_DOWN_TIMEOUT  seconds the event stream may stay down, the bot reconnecting after
+                 5 s and doubling the pause up to 60 s per consecutive failure, before the
+                 bot stops reporting itself healthy to the systemd watchdog (default 600)
   STALL_ABORT_TIMEOUT  seconds to wait for the opponent's first move before aborting the
                  game (default 120): until both sides have moved the clocks do not run,
                  so a silent opponent would hold the game slot forever. 0 disables
@@ -66,7 +69,8 @@ BOT accounts) and refreshed hourly, so it survives restarts and counts external 
 
 Liveness: when started by systemd with Type=notify and WatchdogSec, the bot sends
 READY=1 after login and WATCHDOG=1 every WatchdogSec/3 seconds while the event stream
-is healthy (connected, or reconnected after fewer than 3 consecutive failures).
+is healthy: delivering lines, or down for less than STREAM_DOWN_TIMEOUT while the bot
+keeps reconnecting, so a Lichess-side blip does not get the bot restarted mid-game.
 
 On SIGTERM or SIGINT the bot drains: it declines new challenges, lets games in
 progress finish, then exits 0. A second signal exits immediately.
@@ -144,6 +148,7 @@ class Config:
         self.max_games = int(os.environ.get("MAX_GAMES", "1"))
         self.shutdown_timeout = float(os.environ.get("SHUTDOWN_TIMEOUT", "900"))
         self.stream_read_timeout = float(os.environ.get("STREAM_READ_TIMEOUT", "90"))
+        self.stream_down_timeout = float(os.environ.get("STREAM_DOWN_TIMEOUT", "600"))
         self.stall_abort_timeout = float(os.environ.get("STALL_ABORT_TIMEOUT", "120"))
         self.login_timeout = float(os.environ.get("LOGIN_TIMEOUT", "300"))
         self.heartbeat_interval = float(os.environ.get("HEARTBEAT_INTERVAL", "300"))
@@ -668,6 +673,7 @@ class Bot:
         self.stream_failures = 0
         self.stream_ok = False
         self.last_line_at: float | None = None
+        self.stream_down_at: float | None = None  # monotonic start of the current outage
         self.finished_at: list[float] = []
         self.clock_history: list[tuple[float, tuple[int, int]]] = []  # (monotonic end, clock) of bot games, 24 h
         self.results: list[tuple[float, str, str]] = []  # (monotonic end, opponent id, win/draw/loss), 24 h
@@ -894,10 +900,13 @@ class Bot:
         with self.session.get("https://lichess.org/api/stream/event", stream=True) as resp:
             resp.raise_for_status()
             self.stream_ok = True
-            self.stream_failures = 0
             self.last_line_at = time.monotonic()
             for line in resp.iter_lines():
+                # Any line, keep-alives included, proves the stream works: the outage is
+                # over and the reconnect backoff starts from scratch.
                 self.last_line_at = time.monotonic()
+                self.stream_failures = 0
+                self.stream_down_at = None
                 if line:
                     yield json.loads(line)
 
@@ -905,10 +914,25 @@ class Bot:
         return None if self.last_line_at is None else time.monotonic() - self.last_line_at
 
     def healthy(self) -> bool:
+        """Liveness for the systemd watchdog. A connected stream that has been silent
+        far beyond the read timeout is wedged. A stream that is down is fine while the
+        bot has been reconnecting for less than STREAM_DOWN_TIMEOUT: Lichess-side blips
+        (502s, dropped responses) last seconds to minutes and games in progress run on
+        their own streams, so restarting the bot would only cost the game (see #53)."""
         age = self.stream_age()
         if self.stream_ok and age is not None and age > 3 * self.cfg.stream_read_timeout:
             return False
-        return self.stream_ok or self.stream_failures < 3
+        if self.stream_down_at is None:
+            return True
+        return time.monotonic() - self.stream_down_at < self.cfg.stream_down_timeout
+
+    def reconnect_delay(self, error: Exception | None = None) -> float:
+        """Seconds to wait before reconnecting the event stream: 5 s after the first
+        failure, doubling per consecutive failure up to 60 s, so an outage is not
+        hammered; a 429 always waits the full minute Lichess asks for."""
+        delay = min(5.0 * 2 ** max(self.stream_failures - 1, 0), 60.0)
+        status = getattr(getattr(error, "response", None), "status_code", None)
+        return 60.0 if status == 429 else delay
 
     def heartbeat(self) -> None:
         period = watchdog_period()
@@ -925,7 +949,11 @@ class Bot:
                 with self.lock:
                     n = len(self.games)
                 age = self.stream_age()
-                stream = f"ok (last line {age:.0f}s ago)" if self.stream_ok else f"down ({self.stream_failures} failures)"
+                if self.stream_ok:
+                    stream = f"ok (last line {age:.0f}s ago)"
+                else:
+                    down = 0.0 if self.stream_down_at is None else time.monotonic() - self.stream_down_at
+                    stream = f"down ({self.stream_failures} failures, {down:.0f}s)"
                 log.info("alive: %d game(s), stream %s, %d games in 24h%s", n, stream,
                          self.games_last_24h(), ", draining" if self.draining.is_set() else "")
                 last_log = now
@@ -1062,19 +1090,27 @@ class Bot:
         sd_notify("READY=1")
         threading.Thread(target=self.heartbeat, name="heartbeat", daemon=True).start()
         while not self.draining.is_set():
+            error: Exception | None = None
             try:
                 for event in self.event_stream():
                     self.handle(event)
-                # Stream ended without error (server closed it): reconnect quietly.
-                self.stream_ok = False
             except Exception as e:  # noqa: BLE001
-                self.stream_ok = False
-                if self.draining.is_set():
-                    break
-                self.stream_failures += 1
-                log.warning("event stream failed (%s: %s), reconnecting in 5s (failure %d)",
-                            type(e).__name__, e, self.stream_failures)
-                time.sleep(5)
+                error = e
+            self.stream_ok = False
+            if self.draining.is_set():
+                break
+            now = time.monotonic()
+            if self.stream_down_at is None:
+                self.stream_down_at = now
+            self.stream_failures += 1
+            delay = self.reconnect_delay(error)
+            if error is None:
+                # The server closed the stream (it does on deploys): reconnect after a pause.
+                log.info("event stream closed, reconnecting in %.0fs (attempt %d)", delay, self.stream_failures)
+            else:
+                log.warning("event stream failed (%s: %s), reconnecting in %.0fs (failure %d, down for %.0fs)",
+                            type(error).__name__, error, delay, self.stream_failures, now - self.stream_down_at)
+            time.sleep(delay)
         # Draining: the drain thread exits the process once the games are over.
         while True:
             time.sleep(60)

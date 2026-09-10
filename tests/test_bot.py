@@ -4,6 +4,9 @@ import signal
 import threading
 import time
 
+import pytest
+import requests
+
 from bot.lichess_bot import Bot, Config, Game, game_result, retry_after
 
 
@@ -35,6 +38,7 @@ def make_bot(timeout=30.0):
     b.drain_outcomes = {}
     b.stream_ok = True
     b.stream_failures = 0
+    b.stream_down_at = None
     b.last_line_at = None
     b.finished_at = []
     b.clock_history = []
@@ -47,7 +51,8 @@ def make_bot(timeout=30.0):
     b.exit = b.exits.append
     b.idle_paused = False
     b.idle_pause_logged = None
-    b.cfg = type("Cfg", (), {"shutdown_timeout": timeout, "max_games": 1, "idle_pause_file": None, "book": False, "tablebase": False})()
+    b.cfg = type("Cfg", (), {"shutdown_timeout": timeout, "max_games": 1, "idle_pause_file": None, "book": False,
+                             "tablebase": False, "stream_read_timeout": 90, "stream_down_timeout": 600})()
     return b
 
 
@@ -202,16 +207,92 @@ def test_game_done_records_drain_outcomes():
     assert b.drain_outcomes == {"crashed": 1, "finished": 1}
 
 
-def test_healthy_tracks_stream_failures():
+def test_healthy_tolerates_an_outage_shorter_than_the_down_timeout():
     b = make_bot()
     b.stream_ok = False
-    b.stream_failures = 0
-    b.finished_at = []
+    b.stream_failures = 5
+    b.stream_down_at = time.monotonic() - 30
     assert b.healthy()
-    b.stream_failures = 3
+    b.stream_down_at = time.monotonic() - 601
     assert not b.healthy()
+    b.stream_down_at = None
+    assert b.healthy()
     b.stream_ok = True
     assert b.healthy()
+
+
+def test_reconnect_delay_doubles_to_a_minute_and_honours_429():
+    b = make_bot()
+    delays = []
+    for n in range(1, 8):
+        b.stream_failures = n
+        delays.append(b.reconnect_delay(None))
+    assert delays == [5, 10, 20, 40, 60, 60, 60]
+    b.stream_failures = 1
+    limited = requests.HTTPError("429", response=type("R", (), {"status_code": 429})())
+    assert b.reconnect_delay(limited) == 60
+    assert b.reconnect_delay(ConnectionError("dropped")) == 5
+
+
+def test_run_backs_off_between_reconnects_and_recovers(monkeypatch, caplog):
+    b = make_bot()
+    b.stream_ok = False
+    b.cfg.idle_challenge = False
+    monkeypatch.setattr("bot.lichess_bot.sd_notify", lambda state: None)
+    monkeypatch.setattr(Bot, "heartbeat", lambda self: None)
+    handled = []
+    b.handle = handled.append
+
+    class Done(Exception):
+        pass
+
+    class Resp:
+        def __init__(self, status, lines):
+            self.status, self.lines = status, lines
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def raise_for_status(self):
+            if self.status != 200:
+                raise requests.HTTPError(f"{self.status}", response=type("R", (), {"status_code": self.status})())
+
+        def iter_lines(self):
+            yield from self.lines
+
+    attempts = []
+
+    def get(self, url, stream=True):
+        attempts.append(url)
+        n = len(attempts)
+        if n == 1:
+            return Resp(502, [])
+        if n == 2:
+            return Resp(200, [])  # closed by the server before any line
+        if n == 3:
+            return Resp(429, [])
+        b.draining.set()  # the last stream ends the loop
+        return Resp(200, [b"", b'{"type": "gameFinish", "game": {"id": "g1"}}'])
+
+    b.session = type("S", (), {"get": get})()
+    slept = []
+
+    def fake_sleep(s):
+        slept.append(s)
+        if b.draining.is_set():
+            raise Done
+
+    monkeypatch.setattr(time, "sleep", fake_sleep)
+    with caplog.at_level(logging.INFO), pytest.raises(Done):
+        b.run()
+    assert [e["type"] for e in handled] == ["gameFinish"]
+    assert slept[:3] == [5, 10, 60]  # 502, then a close before any line, then a 429 waits the full minute
+    assert b.stream_failures == 0 and b.stream_down_at is None
+    assert "event stream closed, reconnecting in 10s (attempt 2)" in caplog.text
+    assert "failure 3, down for" in caplog.text
 
 
 def test_games_last_24h_counts_and_prunes():
