@@ -51,8 +51,42 @@ def test_second_job_waits_for_the_first(tmp_path: Path) -> None:
     )
     assert first.wait() == 0
     assert second.returncode == 3
-    assert "waits for the cores lock" in second.stdout
+    assert "waits for" in second.stdout  # its turn, or the lock if the first is still exiting
     lines = (tmp_path / "queue.log").read_text().splitlines()
     kinds = [line.split()[2] for line in lines]
     assert kinds == ["start", "end", "start", "end"]
     assert lines[1].endswith("end a rc=0") and lines[3].endswith("end b rc=3")
+
+
+def queue_env(tmp_path: Path) -> dict[str, str]:
+    return {
+        **os.environ,
+        "QUEUE_LOCK": str(tmp_path / "lock"),
+        "QUEUE_LOG": str(tmp_path / "queue.log"),
+        "QUEUE_POLL": "0.05",
+    }
+
+
+def test_jobs_start_in_submission_order(tmp_path: Path) -> None:
+    env = queue_env(tmp_path)
+    jobs = []
+    for name in "abcde":
+        jobs.append(subprocess.Popen([QUEUE, "--name", name, "--", "sleep", "0.3"], env=env, stdout=subprocess.DEVNULL))
+        time.sleep(0.15)
+    assert [job.wait() for job in jobs] == [0] * 5
+    starts = [line.split()[3] for line in (tmp_path / "queue.log").read_text().splitlines() if line.split()[2] == "start"]
+    assert starts == ["a:", "b:", "c:", "d:", "e:"]
+    assert list((tmp_path / "lock.d").iterdir()) == []
+
+
+def test_stale_ticket_of_a_dead_process_is_removed(tmp_path: Path) -> None:
+    env = queue_env(tmp_path)
+    tickets = tmp_path / "lock.d"
+    tickets.mkdir()
+    stale = tickets / ("0" * 19 + "-999999999")
+    stale.touch()
+    (tickets / (stale.name + ".ready")).touch()
+    result = subprocess.run([QUEUE, "--name", "x", "--", "true"], env=env, capture_output=True, text=True, check=False)
+    assert result.returncode == 0
+    assert "waits for its turn" not in result.stdout
+    assert list(tickets.iterdir()) == []

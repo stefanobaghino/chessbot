@@ -106,4 +106,7 @@ training, both restricted to cores 2-3. `match.sh` freezes them while timed game
 share cores 2-3 at once. `scripts/queue.sh [--window] [--est MINUTES] [--name NAME] --
 <command>` runs any job behind that lock and, with `--window`, waits for the next 09:00
 from which its estimated duration ends before 21:00 (a job queued at 18:30 for tomorrow
-therefore starts tomorrow, not now). Starts, ends and exit codes go to `matches/queue.log`.
+therefore starts tomorrow, not now). Queued jobs start in the order they were queued: each
+takes a ticket under `matches/.cores23.lock.d/` and waits for older live, ready tickets; a
+job waiting for its window does not hold the line. Starts, ends and exit codes go to
+`matches/queue.log`.
