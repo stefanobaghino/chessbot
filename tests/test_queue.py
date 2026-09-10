@@ -90,3 +90,23 @@ def test_stale_ticket_of_a_dead_process_is_removed(tmp_path: Path) -> None:
     assert result.returncode == 0
     assert "waits for its turn" not in result.stdout
     assert list(tickets.iterdir()) == []
+
+
+def test_list_shows_queued_jobs_in_order(tmp_path: Path) -> None:
+    env = queue_env(tmp_path)
+    tickets = tmp_path / "lock.d"
+    tickets.mkdir()
+    first = subprocess.Popen([QUEUE, "--name", "a", "--", "sleep", "1"], env=env, stdout=subprocess.DEVNULL)
+    time.sleep(0.3)
+    second = subprocess.Popen([QUEUE, "--name", "b", "--", "sh", "-c", "true"], env=env, stdout=subprocess.DEVNULL)
+    time.sleep(0.3)
+    # A dead job's ticket younger than the live ones: no waiter looks at it, --list cleans it.
+    stale = tickets / f"{time.time_ns():019d}-999999999"
+    stale.write_text("old: sleep 1\n")
+    listing = subprocess.run([QUEUE, "--list"], env=env, capture_output=True, text=True, check=True).stdout.splitlines()
+    assert [line.split()[0] for line in listing] == ["running", "ready", "stale"]
+    assert listing[0].endswith("a: sleep 1") and listing[1].endswith("b: sh -c true") and listing[2].endswith("old: sleep 1")
+    assert f"pid {first.pid}" in listing[0] and f"pid {second.pid}" in listing[1]
+    assert first.wait() == 0 and second.wait() == 0
+    assert not stale.exists()
+    assert subprocess.run([QUEUE, "--list"], env=env, capture_output=True, text=True, check=True).stdout == "queue: empty\n"

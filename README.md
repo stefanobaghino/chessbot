@@ -108,5 +108,6 @@ share cores 2-3 at once. `scripts/queue.sh [--window] [--est MINUTES] [--name NA
 from which its estimated duration ends before 21:00 (a job queued at 18:30 for tomorrow
 therefore starts tomorrow, not now). Queued jobs start in the order they were queued: each
 takes a ticket under `matches/.cores23.lock.d/` and waits for older live, ready tickets; a
-job waiting for its window does not hold the line. Starts, ends and exit codes go to
-`matches/queue.log`.
+job waiting for its window does not hold the line. `scripts/queue.sh --list` shows the
+queued jobs in order (running, ready, waiting for the window, stale) with their pid and
+command. Starts, ends and exit codes go to `matches/queue.log`.
