@@ -7,7 +7,8 @@ A chess engine and Lichess bot built to run unattended on a Raspberry Pi 5.
   hand-crafted evaluation (PeSTO piece-square tables plus king safety, pawn structure,
   mobility). Move generation comes from the `cozy-chess` crate. Lazy SMP (`Threads`)
   and pondering (`go ponder` / `ponderhit`, `bestmove ... ponder`) are supported; the bot
-  ponders by default (`PONDER=0` turns it off).
+  ponders by default (`PONDER=0` turns it off) and runs `ENGINE_THREADS=2` in production,
+  worth +65 Elo at 10+0.1 on its two pinned cores (see #52).
   The bot plays the first moves from the Lichess masters explorer (`BOOK`) and 7-piece
   endgames from the Lichess tablebase (`TABLEBASE`): won and lost positions take the
   tablebase move, drawn ones keep the engine's move unless it loses. The lookup is

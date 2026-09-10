@@ -5,7 +5,8 @@ DOTENV_PATH (default: <repo>/.env) without overriding variables already set:
   LICHESS_TOKEN  personal API token with bot:play, challenge:read, challenge:write
   ENGINE_PATH    path to the UCI engine binary (default: engine/target/release/chessbot-engine)
   ENGINE_HASH    hash size in MB (default 128)
-  ENGINE_THREADS search threads passed as the Threads UCI option (default 1)
+  ENGINE_THREADS search threads passed as the Threads UCI option (default 1); with
+                 the bot pinned to two cores, 2 measured +65 Elo at 10+0.1 (see #52)
   CONTEMPT_PER_100  centipawns of draw aversion per 100 rating points the bot is above
                  the opponent (default 10); negative below, so the engine seeks draws
                  against stronger opponents. 0 disables contempt
