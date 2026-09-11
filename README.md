@@ -80,6 +80,10 @@ every epoch and resumes from it when run again with the same arguments; with `--
 it exits with status 3 instead of starting an epoch that would end after 21:00.
 `scripts/train_net6.sh` is the net6 job built on both: a no-op until every relabel chunk
 exists, otherwise it trains (or resumes) inside the window.
+`scripts/train_net8.sh` is the same shape for the self-play batches of #51: once batches 1 and 2
+are relabelled it builds the deduplicated set, trains a net6-shaped net and a king-bucketed one
+with the held-out set, and gates both against the released engine (`--ready` only reports
+whether the data is complete).
 `scripts/install_timers.sh` installs both as persistent daily user timers (09:00 and 09:05,
 `CPUQuota=200%`, i.e. half of the four cores) that survive a reboot; `--uninstall` removes them.
 
