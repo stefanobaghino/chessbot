@@ -1,13 +1,16 @@
 """Train a (768 -> N)x2 -> 1 NNUE with SCReLU and export quantised weights.
 
 Usage: train.py data.npz out.bin [--hidden 256] [--epochs 20] [--batch 16384] [--lr 1e-3]
-                [--checkpoint out.bin.ckpt] [--window 9-21]
+                [--checkpoint out.bin.ckpt] [--window 9-21] [--holdout held.npz]
 
 The full training state (weights, optimiser, LR schedule, RNG, data split) is saved to the
 checkpoint after every epoch and picked up again by the same command, so a run can be
 stopped and resumed. With --window H1-H2 an epoch is only started when it is expected to
 finish inside that daily window (estimate: the previous epoch's duration), and the process
 exits with status 3 otherwise; run the same command again after the window opens.
+With --holdout the loss on that set (never trained on, see dedup.py --exclude) is printed
+after every epoch and the net is exported only when it improves, so out.bin holds the best
+epoch rather than the last one.
 """
 import argparse
 import datetime as dt
@@ -120,6 +123,7 @@ def main():
     ap.add_argument("--limit", type=int, default=0)
     ap.add_argument("--checkpoint", default=None, help="full-state checkpoint, default <out>.ckpt")
     ap.add_argument("--window", default=None, help="hours H1-H2 inside which epochs may run, e.g. 9-21")
+    ap.add_argument("--holdout", default=None, help="npz never used for training; its loss is reported and the export keeps the best epoch")
     args = ap.parse_args()
     ckpt_path = args.checkpoint or args.out + ".ckpt"
     window = parse_window(args.window)
@@ -140,13 +144,17 @@ def main():
     val_idx, train_idx = perm[:n_val], perm[n_val:]
     print(f"{len(train_idx)} train / {n_val} val positions")
 
+    holdout = None
+    if args.holdout:
+        h = np.load(args.holdout)
+        holdout = (h["pieces"], h["stm"], h["score"].astype(np.float32))
     net = Net(args.hidden)
     if args.resume:
         net.load_state_dict(torch.load(args.resume))
     opt = torch.optim.Adam(net.parameters(), lr=args.lr)
     sched = torch.optim.lr_scheduler.StepLR(opt, step_size=max(1, args.epochs // 3), gamma=0.3)
-    first_epoch, est = 0, 0.0
-    key = {"data": args.data, "hidden": args.hidden, "epochs": args.epochs, "n": n}
+    first_epoch, est, best = 0, 0.0, float("inf")
+    key = {"data": args.data, "hidden": args.hidden, "epochs": args.epochs, "n": n, "holdout": args.holdout}
     if os.path.exists(ckpt_path):
         ck = torch.load(ckpt_path, weights_only=False)
         if ck["key"] != key:
@@ -156,17 +164,25 @@ def main():
         sched.load_state_dict(ck["sched"])
         rng.bit_generator.state = ck["rng"]
         train_idx = ck["train_idx"]
-        first_epoch, est = ck["epoch"], ck["epoch_seconds"]
+        first_epoch, est, best = ck["epoch"], ck["epoch_seconds"], ck.get("best", float("inf"))
         print(f"resumed from {ckpt_path} after epoch {first_epoch}/{args.epochs}", flush=True)
         if first_epoch >= args.epochs:
             print("nothing left to do", flush=True)
             return
 
-    def batch_loss(idx):
-        us_i, us_o, th_i, th_o = features(pieces[idx], stm[idx])
-        target = torch.sigmoid(torch.from_numpy(score[idx]) / SCALE)
+    def batch_loss(idx, data=(pieces, stm, score)):
+        p, s, sc = data
+        us_i, us_o, th_i, th_o = features(p[idx], s[idx])
+        target = torch.sigmoid(torch.from_numpy(sc[idx]) / SCALE)
         pred = torch.sigmoid(net(us_i, us_o, th_i, th_o))
         return ((pred - target) ** 2).mean()
+
+    def holdout_loss():
+        if holdout is None:
+            return None
+        m = len(holdout[2])
+        with torch.no_grad():
+            return float(np.mean([batch_loss(np.arange(s, min(s + args.batch, m)), holdout).item() for s in range(0, m, args.batch)]))
 
     for epoch in range(first_epoch, args.epochs):
         if window and not window_allows(window, est):
@@ -189,11 +205,16 @@ def main():
         net.eval()
         with torch.no_grad():
             vl = np.mean([batch_loss(np.sort(val_idx[s : s + args.batch])).item() for s in range(0, n_val, args.batch)])
-        print(f"epoch {epoch + 1}/{args.epochs} train {total / nb:.5f} val {vl:.5f} lr {sched.get_last_lr()[0]:.1e} {time.time() - t0:.0f}s", flush=True)
-        torch.save(net.state_dict(), args.out + ".pt")
-        export(net, args.out)
+        hl = holdout_loss()
+        extra = f" holdout {hl:.5f}" if hl is not None else ""
+        print(f"epoch {epoch + 1}/{args.epochs} train {total / nb:.5f} val {vl:.5f}{extra} lr {sched.get_last_lr()[0]:.1e} {time.time() - t0:.0f}s", flush=True)
+        # Without a holdout every epoch is exported; with one, only the epochs that improve on it.
+        if hl is None or hl < best:
+            best = hl if hl is not None else best
+            torch.save(net.state_dict(), args.out + ".pt")
+            export(net, args.out)
         est = time.time() - t0
-        state = {"key": key, "epoch": epoch + 1, "epoch_seconds": est, "net": net.state_dict(),
+        state = {"key": key, "epoch": epoch + 1, "epoch_seconds": est, "best": best, "net": net.state_dict(),
                  "opt": opt.state_dict(), "sched": sched.state_dict(), "rng": rng.bit_generator.state,
                  "train_idx": train_idx}
         torch.save(state, ckpt_path + ".tmp")

@@ -70,7 +70,12 @@ scripts/match.sh 2000 100 10+0.1 3 goal
 depth 10 in resumable 50k chunks (`x_d10_<i>.npz`, pass them comma-separated to
 `train/train.py`), starting a chunk only if it can finish before 21:00; rerun the same
 command after 09:00 to resume. `train/fens_diff.py` picks the positions of self-play batches
-that have not been labelled yet. `train/train.py` saves its full state to `<out>.ckpt` after
+that have not been labelled yet. `train/dedup.py out.npz a.npz b.npz [--exclude held.npz]`
+merges datasets with each position once (the first file wins) and leaves out the held-out
+positions; `train/train.py --holdout held.npz` prints the loss on that set after every epoch
+and exports only the epochs that improve it. A training list must not repeat files: the
+random validation split then leaks into the training set and hides overfitting (see #44).
+`train/train.py` saves its full state to `<out>.ckpt` after
 every epoch and resumes from it when run again with the same arguments; with `--window 9-21`
 it exits with status 3 instead of starting an epoch that would end after 21:00.
 `scripts/train_net6.sh` is the net6 job built on both: a no-op until every relabel chunk
