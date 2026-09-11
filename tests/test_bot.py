@@ -468,6 +468,7 @@ def test_rejected_challenge_skips_the_opponent_until_the_daily_limit_resets():
     b.client.challenges.create = reject
     assert b.challenge_once() is False
     assert b.skip_until["opp"] - time.monotonic() > 28690
+    assert b.pending_challenge is None
 
 
 def test_challenge_once_returns_true_when_game_starts():
@@ -480,11 +481,49 @@ def test_challenge_once_returns_true_when_game_starts():
     def start_game():
         time.sleep(0.3)
         with b.lock:
-            b.games["g1"] = threading.Thread()
+            b.games["c1"] = threading.Thread()  # the game carries the challenge's id
 
     threading.Thread(target=start_game).start()
     assert b.challenge_once() is True
     assert b.pending_challenge is None
+
+
+def test_challenge_once_withdraws_when_another_game_takes_the_slot():
+    """An incoming game that starts while the outgoing challenge is pending must not lead to
+    two games (see #57): the challenge is withdrawn and the opponent is not blamed."""
+    b = idle_bot(idle_accept_timeout=5)
+    calls = []
+    b.client.bots.get_online_bots = lambda limit=None: iter([bot_entry("opp", 2050)])
+    b.client.challenges = type("Ch", (), {})()
+    b.client.challenges.create = lambda *a, **k: {"id": "c1"}
+    b.client.challenges.cancel = lambda cid: calls.append(("cancel", cid))
+
+    def start_other_game():
+        time.sleep(0.3)
+        with b.lock:
+            b.games["g1"] = threading.Thread()
+
+    threading.Thread(target=start_other_game).start()
+    assert b.challenge_once() is False
+    assert calls == [("cancel", "c1")]
+    assert b.pending_challenge is None
+    assert "opp" not in b.skip_until
+
+
+def test_incoming_challenge_is_declined_while_an_outgoing_one_is_pending():
+    b = idle_bot()
+    ch = {"id": "in", "challenger": {"id": "human", "name": "human"}, "variant": {"key": "standard"}, "speed": "blitz"}
+    assert b.should_accept(ch) is None
+    b.pending_challenge = "creating"
+    assert b.should_accept(ch) == "later"
+    b.pending_challenge = "c1"
+    assert b.should_accept(ch) == "later"
+    b.pending_challenge = None
+    b.cfg.max_games = 2
+    b.games["g1"] = threading.Thread()
+    assert b.should_accept(ch) is None
+    b.pending_challenge = "c1"
+    assert b.should_accept(ch) == "later"
 
 
 def test_declined_event_clears_pending_challenge():
@@ -1185,3 +1224,21 @@ def test_draw_offer_follows_the_last_score_outside_the_tablebase():
     g.maybe_move(engine, board, chess.BLACK, {"wtime": 60000, "btime": 60000, "wdraw": True})
     assert posted == ["/api/bot/game/g1/draw/yes"] and engine.played == 1
     assert Game.draw_offered({"bdraw": True}, chess.WHITE) and not Game.draw_offered({"bdraw": True}, chess.BLACK)
+
+
+def test_game_start_over_capacity_is_played_and_logged(monkeypatch, caplog):
+    b = make_bot()
+    b.games["g1"] = threading.Thread()
+
+    class FakeGame:
+        def __init__(self, *args):
+            self.started = False
+
+        def start(self):
+            self.started = True
+
+    monkeypatch.setattr("bot.lichess_bot.Game", FakeGame)
+    with caplog.at_level(logging.ERROR):
+        b.handle({"type": "gameStart", "game": {"id": "g2"}})
+    assert b.games["g2"].started
+    assert "game g2 exceeds MAX_GAMES=1 with 1 running" in caplog.text

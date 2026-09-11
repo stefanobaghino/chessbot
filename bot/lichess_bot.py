@@ -13,7 +13,9 @@ DOTENV_PATH (default: <repo>/.env) without overriding variables already set:
   CONTEMPT_MAX   cap on the contempt in centipawns (default 30)
   PONDER         1 to keep searching the expected reply on the opponent's time
                  (default 1); costs a core for the whole game, 0 disables it
-  MAX_GAMES      concurrent games to accept (default 1)
+  MAX_GAMES      concurrent games to accept (default 1); an outgoing idle challenge
+                 holds a slot while it is pending, so incoming challenges are declined
+                 with "later" until the opponent answers or the challenge is withdrawn
   SHUTDOWN_TIMEOUT  seconds to wait for games to finish after SIGTERM/SIGINT before
                  resigning them and exiting (default 900)
   STREAM_READ_TIMEOUT  seconds without any byte from the Lichess event stream (it sends
@@ -849,7 +851,8 @@ class Bot:
         if self.opponent_decline_reason(challenge):
             return "generic"
         with self.lock:
-            if len(self.games) >= self.cfg.max_games:
+            # A pending outgoing challenge holds a slot: its game may start any moment (see #57).
+            if len(self.games) + (self.pending_challenge is not None) >= self.cfg.max_games:
                 return "later"
         return None
 
@@ -1038,9 +1041,13 @@ class Bot:
             log.info("idle: no suitable opponent among %d online bots", len(bots))
             return False
         limit, inc = self.next_idle_clock()
+        with self.lock:
+            self.pending_challenge = "creating"  # holds the game slot while the request is in flight (see #57)
         try:
             ch = self.client.challenges.create(opp["id"], rated=self.cfg.idle_rated, clock_limit=limit, clock_increment=inc)
         except Exception as e:  # noqa: BLE001
+            with self.lock:
+                self.pending_challenge = None
             # A bot that played its 100 bot games of the day is rejected with the time
             # until the reset; anything else is retried after an hour (#37).
             wait = retry_after(e) or 3600
@@ -1055,22 +1062,34 @@ class Bot:
         deadline = time.monotonic() + self.cfg.idle_accept_timeout
         while time.monotonic() < deadline:
             with self.lock:
-                if self.games or self.pending_challenge is None:
-                    started = bool(self.games)
+                if cid in self.games:  # Lichess gives the game the challenge's id
                     self.pending_challenge = None
-                    if not started:
-                        self.skip_until[opp["id"]] = time.monotonic() + 3600
-                    return started
+                    return True
+                if self.pending_challenge is None:  # declined or cancelled, see handle()
+                    self.skip_until[opp["id"]] = time.monotonic() + 3600
+                    return False
+                running = len(self.games)
+            if running >= self.cfg.max_games:
+                # Another game took the slot (a reattached one, say): withdraw before the
+                # opponent accepts, or two games would run at once (see #57).
+                with self.lock:
+                    self.pending_challenge = None
+                self.cancel_challenge(cid)
+                log.info("idle: withdrew the challenge to %s, %d game(s) already running", bot_name(opp), running)
+                return False
             time.sleep(0.5)
         with self.lock:
             self.pending_challenge = None
+        self.cancel_challenge(cid)
+        log.info("idle: %s did not accept within %.0fs, cancelled", bot_name(opp), self.cfg.idle_accept_timeout)
+        self.skip_until[opp["id"]] = time.monotonic() + 3600
+        return False
+
+    def cancel_challenge(self, cid: str) -> None:
         try:
             self.client.challenges.cancel(cid)
         except Exception as e:  # noqa: BLE001
             log.debug("idle: cancel %s failed (%s)", cid, e)
-        log.info("idle: %s did not accept within %.0fs, cancelled", bot_name(opp), self.cfg.idle_accept_timeout)
-        self.skip_until[opp["id"]] = time.monotonic() + 3600
-        return False
 
     def idle_loop(self) -> None:
         while True:
@@ -1144,6 +1163,11 @@ class Bot:
             with self.lock:
                 if game_id in self.games:
                     return
+                if len(self.games) >= self.cfg.max_games:
+                    # Lichess only starts games the bot agreed to, so this is a bug in the
+                    # slot accounting; forfeiting would be worse than playing (see #57).
+                    log.error("game %s exceeds MAX_GAMES=%d with %d running; playing it anyway",
+                              game_id, self.cfg.max_games, len(self.games))
                 g = Game(self.client, game_id, self.my_id, self.cfg, self.game_done)
                 self.games[game_id] = g
             g.start()
