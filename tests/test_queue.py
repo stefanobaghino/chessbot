@@ -110,3 +110,26 @@ def test_list_shows_queued_jobs_in_order(tmp_path: Path) -> None:
     assert first.wait() == 0 and second.wait() == 0
     assert not stale.exists()
     assert subprocess.run([QUEUE, "--list"], env=env, capture_output=True, text=True, check=True).stdout == "queue: empty\n"
+
+
+def test_now_releases_a_job_waiting_for_its_window(tmp_path: Path) -> None:
+    env = queue_env(tmp_path)
+    # A job that can never fit the window waits for the next 09:00 whatever the time of day.
+    job = subprocess.Popen(
+        [QUEUE, "--window", "--est", "100000", "--name", "w", "--", "sh", "-c", "echo start=$WINDOW_START"],
+        env=env,
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    time.sleep(0.5)
+    assert subprocess.run([QUEUE, "--list"], env=env, capture_output=True, text=True, check=True).stdout.startswith("waiting")
+    nothing = subprocess.run([QUEUE, "--now", "other"], env=env, capture_output=True, text=True, check=False)
+    assert nothing.returncode == 1 and "nothing to release" in nothing.stdout
+    released = subprocess.run([QUEUE, "--now", "w"], env=env, capture_output=True, text=True, check=False)
+    assert released.returncode == 0 and f"released w (pid {job.pid})" in released.stdout
+    out, _ = job.communicate(timeout=10)
+    assert job.returncode == 0
+    assert "waits until" in out and "released early" in out and "start=0" in out
+    log = (tmp_path / "queue.log").read_text().splitlines()
+    assert [line.split()[2] for line in log] == ["release", "start", "end"]
+    assert list((tmp_path / "lock.d").iterdir()) == []

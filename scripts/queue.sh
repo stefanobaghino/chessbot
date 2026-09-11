@@ -13,6 +13,9 @@
 #   --next-start   print the epoch second the job would start at and exit (for tests)
 #   --list         show the queued jobs in order (running, ready, waiting for the
 #                  window, or stale) with their age, pid and command, and exit (see #55)
+#   --now [NAME]   release the job(s) waiting for their window (all without NAME): each
+#                  starts as soon as its turn and the lock allow, with WINDOW_START=0
+#                  exported so a window-aware command starts too, and exit (see #58)
 # Order (see #54): each job takes a ticket, a file named by submission time and pid
 # under <lock>.d/ holding its name and command, and waits until no older ticket of a
 # live process is ready before taking the lock. A job still waiting for its window is
@@ -27,7 +30,7 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 LOCK="${QUEUE_LOCK:-$ROOT/matches/.cores23.lock}"
 LOG="${QUEUE_LOG:-$ROOT/matches/queue.log}"
 TICKETS="$LOCK.d"
-WINDOW=0; EST=60; NAME=""; PRINT_ONLY=0; LIST=0
+WINDOW=0; EST=60; NAME=""; PRINT_ONLY=0; LIST=0; RELEASE=0; RELEASE_NAME=""; EARLY=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --window) WINDOW=1 ;;
@@ -35,6 +38,7 @@ while [ $# -gt 0 ]; do
     --name) NAME="$2"; shift ;;
     --next-start) PRINT_ONLY=1 ;;
     --list) LIST=1 ;;
+    --now) RELEASE=1; if [ $# -gt 1 ] && [ "${2#-}" = "$2" ]; then RELEASE_NAME="$2"; shift; fi ;;
     --) shift; break ;;
     *) echo "queue: unknown option $1" >&2; exit 2 ;;
   esac
@@ -43,19 +47,35 @@ done
 if [ "$LIST" = 1 ]; then
   n=0
   for t in "$TICKETS"/*-*; do
-    case "$t" in *.ready|*.running) continue ;; esac
+    case "$t" in *.ready|*.running|*.now) continue ;; esac
     [ -e "$t" ] || continue
     n=$((n + 1))
     pid="${t##*-}"; stamp="${t##*/}"; stamp="${stamp%-*}"
     age=$(( $(date +%s) - 10#${stamp:0:10} ))
     job=$(cat "$t" 2>/dev/null || true)
-    if ! kill -0 "$pid" 2>/dev/null; then state=stale; rm -f "$t" "$t.ready" "$t.running"
+    if ! kill -0 "$pid" 2>/dev/null; then state=stale; rm -f "$t" "$t.ready" "$t.running" "$t.now"
     elif [ -e "$t.running" ]; then state=running
     elif [ -e "$t.ready" ]; then state=ready
     else state=waiting; fi
     printf '%-8s %6ss  pid %-8s %s\n' "$state" "$age" "$pid" "$job"
   done
   [ "$n" -gt 0 ] || echo "queue: empty"
+  exit 0
+fi
+if [ "$RELEASE" = 1 ]; then
+  n=0
+  for t in "$TICKETS"/*-*; do
+    case "$t" in *.ready|*.running|*.now) continue ;; esac
+    [ -e "$t" ] || continue
+    job=$(cat "$t" 2>/dev/null || true)
+    [ -z "$RELEASE_NAME" ] || [ "${job%%:*}" = "$RELEASE_NAME" ] || continue
+    kill -0 "${t##*-}" 2>/dev/null || continue
+    if [ -e "$t.ready" ] || [ -e "$t.running" ]; then echo "queue: ${job%%:*} is not waiting for the window"; continue; fi
+    : > "$t.now"
+    n=$((n + 1))
+    echo "queue: released ${job%%:*} (pid ${t##*-})"
+  done
+  [ "$n" -gt 0 ] || { echo "queue: nothing to release"; exit 1; }
   exit 0
 fi
 [ $# -gt 0 ] || { echo "queue: no command given" >&2; exit 2; }
@@ -74,13 +94,23 @@ next_start() {
   fi
   echo "$t"
 }
+# Waits for the window start, or for the --now mark, which also exports WINDOW_START=0
+# to the command so that a window-aware one (relabel_chunks.sh) starts early as well.
 wait_window() {
   local t target
   t=$(now); target=$(next_start "$t")
-  if [ "$target" -gt "$t" ]; then
-    echo "queue: $NAME waits until $(date -d "@$target" '+%F %R') ($EST min estimated)"
-    [ -n "${QUEUE_NOW:-}" ] || sleep $((target - t))
-  fi
+  [ "$target" -gt "$t" ] || return 0
+  echo "queue: $NAME waits until $(date -d "@$target" '+%F %R') ($EST min estimated; --now $NAME starts it early)"
+  [ -z "${QUEUE_NOW:-}" ] || return 0
+  while [ "$(now)" -lt "$target" ]; do
+    if [ -e "$TICKET.now" ]; then
+      EARLY=1
+      echo "queue: $NAME released early"
+      echo "$(date '+%F %T') release $NAME" >> "$LOG"
+      return 0
+    fi
+    sleep "${QUEUE_POLL:-5}"
+  done
 }
 
 if [ "$PRINT_ONLY" = 1 ]; then
@@ -91,17 +121,17 @@ fi
 mkdir -p "$(dirname "$LOCK")" "$TICKETS"
 TICKET="$TICKETS/$(printf '%019d' "$(date +%s%N)")-$$"
 echo "$NAME: $*" > "$TICKET"
-trap 'rm -f "$TICKET" "$TICKET.ready" "$TICKET.running"' EXIT
+trap 'rm -f "$TICKET" "$TICKET.ready" "$TICKET.running" "$TICKET.now"' EXIT
 # True while an older ticket belongs to a live process that is ready to run.
 turn_blocked() {
   local t
   for t in "$TICKETS"/*-*; do
-    case "$t" in *.ready|*.running) continue ;; esac
+    case "$t" in *.ready|*.running|*.now) continue ;; esac
     [ -e "$t" ] && [[ "$t" < "$TICKET" ]] || continue
     if kill -0 "${t##*-}" 2>/dev/null; then
       [ -e "$t.ready" ] && return 0
     else
-      rm -f "$t" "$t.ready" "$t.running"
+      rm -f "$t" "$t.ready" "$t.running" "$t.now"
     fi
   done
   return 1
@@ -123,13 +153,14 @@ while :; do
     flock 9
   fi
   # The waits may have pushed a windowed job past 21:00: give the lock back until morning.
-  if [ "$WINDOW" = 1 ] && [ -z "${QUEUE_NOW:-}" ] && [ "$(next_start "$(now)")" -gt "$(now)" ]; then
+  if [ "$WINDOW" = 1 ] && [ "$EARLY" = 0 ] && [ -z "${QUEUE_NOW:-}" ] && [ "$(next_start "$(now)")" -gt "$(now)" ]; then
     flock -u 9; rm -f "$TICKET.ready"; continue
   fi
   break
 done
 : > "$TICKET.running"
 export CORES_LOCKED=1
+if [ "$EARLY" = 1 ]; then export WINDOW_START=0; fi
 echo "$(date '+%F %T') start $NAME: $*" >> "$LOG"
 set +e
 "$@"

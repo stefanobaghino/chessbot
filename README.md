@@ -120,4 +120,7 @@ therefore starts tomorrow, not now). Queued jobs start in the order they were qu
 takes a ticket under `matches/.cores23.lock.d/` and waits for older live, ready tickets; a
 job waiting for its window does not hold the line. `scripts/queue.sh --list` shows the
 queued jobs in order (running, ready, waiting for the window, stale) with their pid and
-command. Starts, ends and exit codes go to `matches/queue.log`.
+command. `scripts/queue.sh --now [NAME]` releases the job(s) waiting for their window when
+the operator allows an early start: each proceeds as soon as its turn and the lock allow, with
+`WINDOW_START=0` exported so a window-aware command such as `relabel_chunks.sh` starts too.
+Starts, ends, early releases and exit codes go to `matches/queue.log`.
