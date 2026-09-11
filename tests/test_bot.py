@@ -23,6 +23,9 @@ class FakeBots:
     def resign_game(self, gid):
         self.calls.append(("resign", gid))
 
+    def abort_game(self, gid):
+        self.calls.append(("abort", gid))
+
     def make_move(self, gid, uci):
         self.calls.append(("move", gid, uci))
 
@@ -44,6 +47,7 @@ def make_bot(timeout=30.0):
     b.clock_history = []
     b.results = []
     b.pending_challenge = None
+    b.withdrawn = {}
     b.skip_until = {}
     b.my_rating = 2000
     b.signals_received = 0
@@ -448,6 +452,7 @@ def test_challenge_once_cancels_when_not_accepted():
     assert ("cancel", "c1") in calls
     assert b.pending_challenge is None
     assert "opp" in b.skip_until
+    assert "c1" in b.withdrawn
 
 
 def test_rejected_challenge_skips_the_opponent_until_the_daily_limit_resets():
@@ -508,6 +513,35 @@ def test_challenge_once_withdraws_when_another_game_takes_the_slot():
     assert calls == [("cancel", "c1")]
     assert b.pending_challenge is None
     assert "opp" not in b.skip_until
+    assert "c1" in b.withdrawn
+
+
+def test_cancel_challenge_retries_and_reports_failures(caplog):
+    b = idle_bot()
+    calls = []
+    b.client.challenges = type("Ch", (), {})()
+
+    def flaky(cid):
+        calls.append(("cancel", cid))
+        if len(calls) < 2:
+            raise RuntimeError("HTTP 502")
+
+    b.client.challenges.cancel = flaky
+    with caplog.at_level(logging.WARNING):
+        assert b.cancel_challenge("c1", sleep=lambda s: None) is True
+    assert calls == [("cancel", "c1")] * 2
+    assert "cancelling challenge c1 failed (HTTP 502), retrying" in caplog.text
+
+    def broken(cid):
+        calls.append(("cancel", cid))
+        raise RuntimeError("HTTP 502")
+
+    calls.clear()
+    b.client.challenges.cancel = broken
+    with caplog.at_level(logging.WARNING):
+        assert b.cancel_challenge("c2", sleep=lambda s: None) is False
+    assert calls == [("cancel", "c2")] * 3
+    assert "cancelling challenge c2 failed 3 times (HTTP 502)" in caplog.text
 
 
 def test_incoming_challenge_is_declined_while_an_outgoing_one_is_pending():
@@ -1242,3 +1276,52 @@ def test_game_start_over_capacity_is_played_and_logged(monkeypatch, caplog):
         b.handle({"type": "gameStart", "game": {"id": "g2"}})
     assert b.games["g2"].started
     assert "game g2 exceeds MAX_GAMES=1 with 1 running" in caplog.text
+
+
+def late_game_bot(monkeypatch, running):
+    """A bot whose idle challenge c1 was withdrawn 570 s ago; the opponent accepts it now (see #59)."""
+    b = make_bot()
+    b.withdrawn = {"c1": time.monotonic() - 570}
+    if running:
+        b.games["g1"] = threading.Thread()
+
+    class FakeGame:
+        def __init__(self, *args):
+            self.started = False
+
+        def start(self):
+            self.started = True
+
+    monkeypatch.setattr("bot.lichess_bot.Game", FakeGame)
+    return b
+
+
+def test_late_acceptance_of_a_withdrawn_challenge_is_aborted_when_the_slot_is_taken(monkeypatch, caplog):
+    b = late_game_bot(monkeypatch, running=True)
+    with caplog.at_level(logging.INFO):
+        b.handle({"type": "gameStart", "game": {"id": "c1"}})
+    assert b.client.bots.calls == [("abort", "c1")]
+    assert "c1" not in b.games and "c1" not in b.withdrawn
+    assert "game c1: the challenge was withdrawn 570s ago and 1 game(s) run; aborted" in caplog.text
+
+
+def test_late_acceptance_of_a_withdrawn_challenge_is_played_when_the_slot_is_free(monkeypatch, caplog):
+    b = late_game_bot(monkeypatch, running=False)
+    with caplog.at_level(logging.INFO):
+        b.handle({"type": "gameStart", "game": {"id": "c1"}})
+    assert b.client.bots.calls == [] and b.games["c1"].started
+    assert "game c1: the challenge was withdrawn 570s ago; playing it" in caplog.text
+
+
+def test_late_acceptance_is_played_when_the_abort_fails(monkeypatch, caplog):
+    b = late_game_bot(monkeypatch, running=True)
+
+    def fail(gid):
+        raise RuntimeError("HTTP 400")
+
+    b.client.bots.abort_game = fail
+    with caplog.at_level(logging.WARNING):
+        b.handle({"type": "gameStart", "game": {"id": "c1"}})
+    assert b.games["c1"].started
+    assert "game c1: abort failed (HTTP 400)" in caplog.text
+    assert "game c1 exceeds MAX_GAMES=1 with 1 running; playing it anyway" in caplog.text

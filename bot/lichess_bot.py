@@ -15,7 +15,9 @@ DOTENV_PATH (default: <repo>/.env) without overriding variables already set:
                  (default 1); costs a core for the whole game, 0 disables it
   MAX_GAMES      concurrent games to accept (default 1); an outgoing idle challenge
                  holds a slot while it is pending, so incoming challenges are declined
-                 with "later" until the opponent answers or the challenge is withdrawn
+                 with "later" until the opponent answers or the challenge is withdrawn.
+                 A withdrawn challenge that the opponent accepts late is aborted if the
+                 slot is taken by then, and played otherwise
   SHUTDOWN_TIMEOUT  seconds to wait for games to finish after SIGTERM/SIGINT before
                  resigning them and exiting (default 900)
   STREAM_READ_TIMEOUT  seconds without any byte from the Lichess event stream (it sends
@@ -681,6 +683,7 @@ class Bot:
         self.clock_history: list[tuple[float, tuple[int, int]]] = []  # (monotonic end, clock) of bot games, 24 h
         self.results: list[tuple[float, str, str]] = []  # (monotonic end, opponent id, win/draw/loss), 24 h
         self.pending_challenge: str | None = None
+        self.withdrawn: dict[str, float] = {}  # cancelled idle challenges: id -> monotonic time (see #59)
         self.idle_paused = False
         self.idle_pause_logged: str | None = None
         self.skip_until: dict[str, float] = {}
@@ -1074,22 +1077,49 @@ class Bot:
                 # opponent accepts, or two games would run at once (see #57).
                 with self.lock:
                     self.pending_challenge = None
-                self.cancel_challenge(cid)
+                self.withdraw_challenge(cid)
                 log.info("idle: withdrew the challenge to %s, %d game(s) already running", bot_name(opp), running)
                 return False
             time.sleep(0.5)
         with self.lock:
             self.pending_challenge = None
-        self.cancel_challenge(cid)
+        self.withdraw_challenge(cid)
         log.info("idle: %s did not accept within %.0fs, cancelled", bot_name(opp), self.cfg.idle_accept_timeout)
         self.skip_until[opp["id"]] = time.monotonic() + 3600
         return False
 
-    def cancel_challenge(self, cid: str) -> None:
+    def withdraw_challenge(self, cid: str) -> None:
+        """Cancels an outgoing challenge and remembers it: Lichess keeps a challenge acceptable
+        long after the bot gave up on it (an opponent took one up 9.5 min later, see #59), so
+        a game that starts from it is recognised in handle()."""
+        with self.lock:
+            cutoff = time.monotonic() - 2 * 86400
+            self.withdrawn = {k: t for k, t in self.withdrawn.items() if t >= cutoff}
+            self.withdrawn[cid] = time.monotonic()
+        self.cancel_challenge(cid)
+
+    def cancel_challenge(self, cid: str, attempts: int = 3, sleep=time.sleep) -> bool:
+        """Cancels the challenge on Lichess, retrying transient failures (see #59)."""
+        for attempt in range(1, attempts + 1):
+            try:
+                self.client.challenges.cancel(cid)
+                return True
+            except Exception as e:  # noqa: BLE001
+                if attempt < attempts:
+                    log.warning("idle: cancelling challenge %s failed (%s), retrying", cid, e)
+                    sleep(2.0)
+                else:
+                    log.error("idle: cancelling challenge %s failed %d times (%s); a late game from it is aborted "
+                              "if the slot is taken", cid, attempts, e)
+        return False
+
+    def abort_game(self, game_id: str) -> bool:
         try:
-            self.client.challenges.cancel(cid)
+            self.client.bots.abort_game(game_id)
+            return True
         except Exception as e:  # noqa: BLE001
-            log.debug("idle: cancel %s failed (%s)", cid, e)
+            log.warning("game %s: abort failed (%s)", game_id, e)
+            return False
 
     def idle_loop(self) -> None:
         while True:
@@ -1160,6 +1190,19 @@ class Bot:
             if self.draining.is_set():
                 log.info("draining, not starting game %s", game_id)
                 return
+            with self.lock:
+                if game_id in self.games:
+                    return
+                running = len(self.games)
+                withdrawn_at = self.withdrawn.pop(game_id, None)
+            if withdrawn_at is not None:
+                # The opponent accepted a challenge the bot had cancelled (see #59). Aborting costs
+                # nothing before the second ply; playing two games at once halves the engine.
+                age = time.monotonic() - withdrawn_at
+                if running >= self.cfg.max_games and self.abort_game(game_id):
+                    log.warning("game %s: the challenge was withdrawn %.0fs ago and %d game(s) run; aborted", game_id, age, running)
+                    return
+                log.info("game %s: the challenge was withdrawn %.0fs ago; playing it", game_id, age)
             with self.lock:
                 if game_id in self.games:
                     return
