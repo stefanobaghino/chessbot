@@ -108,3 +108,21 @@ def test_dedup_keeps_the_first_copy_and_drops_excluded_positions() -> None:
     assert kept.tolist() == [0, 1, 2, 4, 5]
     _, _, kept = dedup.dedup(pieces, stm, score, exclude=(pieces[[5, 1]], stm[[5, 1]]))
     assert kept.tolist() == [0, 2, 4]
+
+
+def test_dedup_keys_differ_for_one_square_and_the_side_to_move() -> None:
+    import dedup
+
+    rng = np.random.default_rng(2)
+    base = rng.integers(0, 13, size=64).astype(np.uint8)
+    boards, stms = [base], [np.uint8(0)]
+    for sq in range(64):  # every square changed, with the other side to move (the a1 case hashed alike once)
+        for code in (0, 3, 6):
+            b = base.copy()
+            b[sq] = (base[sq] + code + 1) % 13
+            boards.append(b)
+            stms.append(np.uint8(1))
+    boards.append(base)
+    stms.append(np.uint8(1))
+    keys = dedup.keys(np.stack(boards), np.array(stms))
+    assert len(np.unique(keys)) == len(keys)

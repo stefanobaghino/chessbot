@@ -72,7 +72,8 @@ depth 10 in resumable 50k chunks (`x_d10_<i>.npz`, pass them comma-separated to
 command after 09:00 to resume. `train/fens_diff.py` picks the positions of self-play batches
 that have not been labelled yet. `train/dedup.py out.npz a.npz b.npz [--exclude held.npz]`
 merges datasets with each position once (the first file wins) and leaves out the held-out
-positions; `train/train.py --holdout held.npz` prints the loss on that set after every epoch
+positions, comparing them through 64-bit hashes so that ten million positions merge in about
+1.5 GB (see #63); `train/train.py --holdout held.npz` prints the loss on that set after every epoch
 and exports only the epochs that improve it. A training list must not repeat files: the
 random validation split then leaks into the training set and hides overfitting (see #44).
 `train/train.py` saves its full state to `<out>.ckpt` after
@@ -84,6 +85,8 @@ exists, otherwise it trains (or resumes) inside the window.
 are relabelled it builds the deduplicated set, trains a net6-shaped net and a king-bucketed one
 with the held-out set, and gates both against the released engine (`--ready` only reports
 whether the data is complete).
+`scripts/train_net9.sh` does the same once all four batches are in (see #63): a hidden-384 and a
+hidden-512 net, 20 epochs each, gated against v0.1.51.
 `scripts/install_timers.sh` installs both as persistent daily user timers (09:00 and 09:05,
 `CPUQuota=200%`, i.e. half of the four cores) that survive a reboot; `--uninstall` removes them.
 
