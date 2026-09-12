@@ -5,6 +5,8 @@ DOTENV_PATH (default: <repo>/.env) without overriding variables already set:
   LICHESS_TOKEN  personal API token with bot:play, challenge:read, challenge:write
   ENGINE_PATH    path to the UCI engine binary (default: engine/target/release/chessbot-engine)
   ENGINE_HASH    hash size in MB (default 128)
+  ENGINE_START_TIMEOUT  seconds for a new engine process to answer `uci` (default 30);
+                 a start that misses it is tried once more before the game gives up (see #61)
   ENGINE_THREADS search threads passed as the Threads UCI option (default 1); with
                  the bot pinned to two cores, 2 measured +65 Elo at 10+0.1 (see #52)
   CONTEMPT_PER_100  centipawns of draw aversion per 100 rating points the bot is above
@@ -85,6 +87,7 @@ progress finish, then exits 0. A second signal exits immediately.
 """
 from __future__ import annotations
 
+import asyncio
 import datetime
 import json
 import logging
@@ -149,6 +152,7 @@ class Config:
             sys.exit("LICHESS_TOKEN is not set (put it in .env)")
         self.engine_path = os.environ.get("ENGINE_PATH", str(ROOT / "engine/target/release/chessbot-engine"))
         self.engine_hash = int(os.environ.get("ENGINE_HASH", "128"))
+        self.engine_start_timeout = float(os.environ.get("ENGINE_START_TIMEOUT", "30"))
         self.engine_threads = int(os.environ.get("ENGINE_THREADS", "1"))
         self.ponder = os.environ.get("PONDER", "1") == "1"
         self.contempt_per_100 = float(os.environ.get("CONTEMPT_PER_100", "10"))
@@ -406,7 +410,22 @@ class Game(threading.Thread):
     def new_engine(self) -> chess.engine.SimpleEngine:
         # Own process group: a signal sent to the bot's group (or cgroup by a service
         # manager configured that way) must not kill the engine mid-search.
-        engine = chess.engine.SimpleEngine.popen_uci(self.cfg.engine_path, setpgrp=True)
+        started = time.monotonic()
+        for attempt in range(1, 3):
+            try:
+                engine = chess.engine.SimpleEngine.popen_uci(self.cfg.engine_path, setpgrp=True,
+                                                             timeout=self.cfg.engine_start_timeout)
+                break
+            except (TimeoutError, asyncio.TimeoutError):
+                # A loaded host (builds, swapping) can delay the handshake past the budget
+                # without anything being wrong with the engine (see #61).
+                if attempt == 2:
+                    raise
+                log.warning("game %s: the engine did not answer uci within %.0fs, starting it again",
+                            self.game_id, self.cfg.engine_start_timeout)
+        took = time.monotonic() - started
+        if took > 2:
+            log.warning("game %s: engine started in %.1fs", self.game_id, took)
         options = {"Hash": self.cfg.engine_hash, "Threads": self.cfg.engine_threads,
                    "Move Overhead": self.cfg.move_overhead}
         if self.contempt is not None:

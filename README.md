@@ -107,7 +107,8 @@ with a timed `TC=10+0.1 scripts/spar.sh` before changing the defaults.
 
 The live bot is pinned to cores 0-1 (`CPUAffinity=0-1` in its systemd unit, see #49). `spar.sh`
 and `match.sh` pin their games to cores 2-3 with `taskset` (override with `SPAR_CPUS`);
-sparring engines alternate moves, so two concurrent games fill the two cores.
+sparring engines alternate moves, so two concurrent games fill the two cores. `validate.sh`
+pins itself to the same cores at nice 10, so a commit or release never slows a live game (see #62).
 Background jobs go into cgroups created once per boot with `sudo scripts/cgroups.sh`:
 `quiet` (one core) for relabelling and data generation, `train` (two cores) for
 training, both restricted to cores 2-3. `match.sh` freezes them while timed games run.

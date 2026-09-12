@@ -2,6 +2,11 @@
 # Validate a source tree: engine build + unit tests + bench + NNUE self-check,
 # Python lint + tests. Usage: scripts/validate.sh <srcdir> <version>
 set -euo pipefail
+# Stay off the live bot's cores 0-1 whoever calls this (the pre-commit hook, release.sh):
+# re-exec once under nice and taskset on the cores the other background jobs use (see #62).
+if [ -z "${VALIDATE_PINNED:-}" ]; then
+  VALIDATE_PINNED=1 exec nice -n 10 taskset -c "${SPAR_CPUS:-2-3}" "$0" "$@"
+fi
 SRC="$1"; VERSION="$2"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 PY="$ROOT/.venv/bin/python"

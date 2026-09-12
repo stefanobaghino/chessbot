@@ -801,6 +801,42 @@ def test_challenge_log_uses_username(caplog):
     assert "idle: challenged Pi0w (1976" in caplog.text
 
 
+def test_new_engine_retries_a_slow_handshake_once(monkeypatch, caplog):
+    """A host under load can miss the startup budget without the engine being broken (see #61)."""
+    import chess.engine
+
+    spawns = []
+
+    class FakeEngine:
+        def configure(self, opts):
+            pass
+
+    def popen_uci(path, **kwargs):
+        spawns.append(kwargs)
+        if len(spawns) == 1:
+            raise TimeoutError()
+        return FakeEngine()
+
+    monkeypatch.setattr(chess.engine.SimpleEngine, "popen_uci", staticmethod(popen_uci))
+    g = make_game()
+    g.cfg = type("Cfg", (), {"engine_path": "x", "engine_hash": 64, "engine_threads": 1, "move_overhead": 250,
+                             "engine_start_timeout": 25.0})()
+    with caplog.at_level(logging.WARNING):
+        assert isinstance(g.new_engine(), FakeEngine)
+    assert spawns == [{"setpgrp": True, "timeout": 25.0}] * 2
+    assert "game g1: the engine did not answer uci within 25s, starting it again" in caplog.text
+    spawns.clear()
+
+    def never(path, **kwargs):
+        spawns.append(kwargs)
+        raise TimeoutError()
+
+    monkeypatch.setattr(chess.engine.SimpleEngine, "popen_uci", staticmethod(never))
+    with pytest.raises(TimeoutError):
+        g.new_engine()
+    assert len(spawns) == 2
+
+
 def test_engine_threads_option_is_configured(monkeypatch):
     import chess.engine
 
@@ -810,9 +846,10 @@ def test_engine_threads_option_is_configured(monkeypatch):
         def configure(self, opts):
             configured.update(opts)
 
-    monkeypatch.setattr(chess.engine.SimpleEngine, "popen_uci", staticmethod(lambda path, setpgrp=False: FakeEngine()))
+    monkeypatch.setattr(chess.engine.SimpleEngine, "popen_uci", staticmethod(lambda path, **kwargs: FakeEngine()))
     g = make_game()
-    g.cfg = type("Cfg", (), {"engine_path": "x", "engine_hash": 64, "engine_threads": 3, "move_overhead": 250})()
+    g.cfg = type("Cfg", (), {"engine_path": "x", "engine_hash": 64, "engine_threads": 3, "move_overhead": 250,
+                             "engine_start_timeout": 30.0})()
     g.contempt = None
     g.new_engine()
     assert configured == {"Hash": 64, "Threads": 3, "Move Overhead": 250}
