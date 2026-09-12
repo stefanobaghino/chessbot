@@ -621,6 +621,36 @@ def make_game():
     return g
 
 
+def test_timeout_session_keeps_plain_calls_short(monkeypatch):
+    """A move POST must not wait the 90 s sized for the event stream's keep-alives (see #60)."""
+    import berserk
+
+    from bot.lichess_bot import TimeoutSession
+
+    monkeypatch.setattr(berserk.TokenSession, "request", lambda self, method, url, **kwargs: kwargs)
+    s = TimeoutSession("tok", 90, 15)
+    assert s.request("POST", "u")["timeout"] == (10, 15)
+    assert s.request("GET", "u", stream=True)["timeout"] == (10, 90)
+    assert s.request("GET", "u", timeout=(1, 2))["timeout"] == (1, 2)
+    assert TimeoutSession("tok", 90).request("POST", "u")["timeout"] == (10, 90)
+
+
+def test_slow_move_warning_splits_search_and_send(caplog):
+    import chess
+
+    g = make_game()
+    g.cfg = type("Cfg", (), {"ponder": False})()
+    g.client.bots.make_move = lambda gid, uci: time.sleep(0.06)
+
+    class Engine:
+        def play(self, board, limit, **kwargs):
+            return chess.engine.PlayResult(chess.Move.from_uci("e2e4"), None)
+
+    with caplog.at_level(logging.WARNING):
+        g.maybe_move(Engine(), chess.Board(), chess.WHITE, {"wtime": 100, "btime": 60000})
+    assert "game g1: move e2e4 took 0.0" in caplog.text and "s of it sending) with 0.1s on the clock" in caplog.text
+
+
 def test_send_move_retries_transport_errors(monkeypatch):
     import berserk
 

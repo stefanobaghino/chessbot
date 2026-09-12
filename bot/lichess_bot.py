@@ -23,6 +23,9 @@ DOTENV_PATH (default: <repo>/.env) without overriding variables already set:
   STREAM_READ_TIMEOUT  seconds without any byte from the Lichess event stream (it sends
                  keep-alives every few seconds) before the stream is considered wedged
                  and reconnected (default 90)
+  REQUEST_TIMEOUT  seconds to wait for the reply to a plain API call such as a move
+                 (default 15): a hung request is retried instead of holding the game
+                 clock for the stream's read timeout (see #60)
   STREAM_DOWN_TIMEOUT  seconds the event stream may stay down, the bot reconnecting after
                  5 s and doubling the pause up to 60 s per consecutive failure, before the
                  bot stops reporting itself healthy to the systemd watchdog (default 600)
@@ -153,6 +156,7 @@ class Config:
         self.max_games = int(os.environ.get("MAX_GAMES", "1"))
         self.shutdown_timeout = float(os.environ.get("SHUTDOWN_TIMEOUT", "900"))
         self.stream_read_timeout = float(os.environ.get("STREAM_READ_TIMEOUT", "90"))
+        self.request_timeout = float(os.environ.get("REQUEST_TIMEOUT", "15"))
         self.stream_down_timeout = float(os.environ.get("STREAM_DOWN_TIMEOUT", "600"))
         self.stall_abort_timeout = float(os.environ.get("STALL_ABORT_TIMEOUT", "120"))
         self.login_timeout = float(os.environ.get("LOGIN_TIMEOUT", "300"))
@@ -205,14 +209,17 @@ class Config:
 
 
 class TimeoutSession(berserk.TokenSession):
-    """Token session with default connect/read timeouts, so a wedged stream raises."""
+    """Token session with default connect/read timeouts: the long one makes a wedged stream
+    raise, the short one keeps a hung plain call, a move above all, from holding the game
+    clock (see #60)."""
 
-    def __init__(self, token: str, read_timeout: float) -> None:
+    def __init__(self, token: str, read_timeout: float, request_timeout: float | None = None) -> None:
         super().__init__(token)
         self.default_timeout = (10, read_timeout)
+        self.request_timeout = (10, read_timeout if request_timeout is None else request_timeout)
 
     def request(self, method, url, **kwargs):
-        kwargs.setdefault("timeout", self.default_timeout)
+        kwargs.setdefault("timeout", self.default_timeout if kwargs.get("stream") else self.request_timeout)
         return super().request(method, url, **kwargs)
 
 
@@ -610,12 +617,14 @@ class Game(threading.Thread):
             if tb_move is not None:
                 log.info("game %s: tablebase move %s instead of %s, which loses", self.game_id, tb_move.uci(), move.uci())
                 move = tb_move
+        searched = time.monotonic()
         self.send_move(move.uci())
         spent = time.monotonic() - started
         if spent > ours / 2:
             # Lookup, search and transport together used most of the clock: a near miss
-            # of the kind that lost game SZCZ69mN on time (#35).
-            log.warning("game %s: move %s took %.2fs with %.1fs on the clock", self.game_id, move.uci(), spent, ours)
+            # of the kind that lost game SZCZ69mN on time (#35). The split says which (#60).
+            log.warning("game %s: move %s took %.2fs (%.2fs of it sending) with %.1fs on the clock",
+                        self.game_id, move.uci(), spent, time.monotonic() - searched, ours)
         return engine
 
     def send_move(self, uci: str) -> None:
@@ -664,7 +673,7 @@ class Game(threading.Thread):
 class Bot:
     def __init__(self, cfg: Config) -> None:
         self.cfg = cfg
-        session = TimeoutSession(cfg.token, cfg.stream_read_timeout)
+        session = TimeoutSession(cfg.token, cfg.stream_read_timeout, cfg.request_timeout)
         self.session = session
         self.client = berserk.Client(session=session)
         account = self.login(cfg.login_timeout)
