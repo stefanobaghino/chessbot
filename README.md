@@ -29,6 +29,12 @@ A chess engine and Lichess bot built to run unattended on a Raspberry Pi 5.
   through endless rematches.
 - `scripts/` — match runner and analysis helpers built on fastchess and Stockfish.
 
+The bot appends one tab-separated line per finished game to `RESULTS_LOG` (default
+`~/.local/state/chessbot/results.tsv`, so it survives releases and reboots): time, the release
+it runs, game id, speed, clock, rated flag, colour, opponent, both pre-game ratings, result,
+status and plies. `scripts/results.py [--by version|day|speed] [--since T]` turns it into a
+score table per release, day or speed (see #64).
+
 ## Build the engine
 
 ```

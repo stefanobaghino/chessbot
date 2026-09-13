@@ -28,6 +28,10 @@ DOTENV_PATH (default: <repo>/.env) without overriding variables already set:
   REQUEST_TIMEOUT  seconds to wait for the reply to a plain API call such as a move
                  (default 15): a hung request is retried instead of holding the game
                  clock for the stream's read timeout (see #60)
+  RESULTS_LOG     file that gets one tab-separated line per finished game: time, release,
+                 game id, speed, clock, rated, colour, opponent, both ratings, result,
+                 status, plies (default ~/.local/state/chessbot/results.tsv; empty disables;
+                 see #64 and scripts/results.py)
   STREAM_DOWN_TIMEOUT  seconds the event stream may stay down, the bot reconnecting after
                  5 s and doubling the pause up to 60 s per consecutive failure, before the
                  bot stops reporting itself healthy to the systemd watchdog (default 600)
@@ -111,6 +115,17 @@ from dotenv import dotenv_values, load_dotenv
 ROOT = Path(__file__).resolve().parent.parent
 log = logging.getLogger("chessbot")
 
+
+def read_version() -> str:
+    """The release the bot runs from: the VERSION file the deploy puts next to the tree, else dev."""
+    try:
+        return (ROOT / "VERSION").read_text().strip() or "dev"
+    except OSError:
+        return "dev"
+
+
+VERSION = read_version()
+
 ACCEPTED_VARIANTS = {"standard", "fromPosition"}
 ACCEPTED_SPEEDS = {"bullet", "blitz", "rapid", "classical"}
 
@@ -161,6 +176,8 @@ class Config:
         self.shutdown_timeout = float(os.environ.get("SHUTDOWN_TIMEOUT", "900"))
         self.stream_read_timeout = float(os.environ.get("STREAM_READ_TIMEOUT", "90"))
         self.request_timeout = float(os.environ.get("REQUEST_TIMEOUT", "15"))
+        state_home = os.environ.get("XDG_STATE_HOME") or str(Path.home() / ".local/state")
+        self.results_log = os.environ.get("RESULTS_LOG", str(Path(state_home) / "chessbot/results.tsv"))
         self.stream_down_timeout = float(os.environ.get("STREAM_DOWN_TIMEOUT", "600"))
         self.stall_abort_timeout = float(os.environ.get("STALL_ABORT_TIMEOUT", "120"))
         self.login_timeout = float(os.environ.get("LOGIN_TIMEOUT", "300"))
@@ -396,6 +413,7 @@ class Game(threading.Thread):
         self.tablebase = Tablebase(min_clock=cfg.tablebase_min_clock) if cfg.tablebase else None
         self.contempt: int | None = None  # set from the ratings in gameFull, kept across engine respawns
         self.last_score: int | None = None  # centipawns for our side from our last search, for draw offers (#41)
+        self.info: dict = {}  # opponent, ratings, speed and clock from gameFull, for the results ledger (#64)
 
     def run(self) -> None:
         outcome = "finished"
@@ -483,10 +501,14 @@ class Game(threading.Thread):
         if "initial" in clock:
             self.clock = (self.ms(clock["initial"]) // 1000, self.ms(clock.get("increment")) // 1000)
         my_color = chess.WHITE if first["white"].get("id") == self.my_id else chess.BLACK
-        opponent = (first["black"] if my_color else first["white"]).get("name", "?")
+        me, them = (first["white"], first["black"]) if my_color else (first["black"], first["white"])
+        opponent = them.get("name", "?")
+        self.info = {"color": "white" if my_color else "black", "opponent": opponent, "my_rating": me.get("rating"),
+                     "opp_rating": them.get("rating"), "speed": first.get("speed", "?"),
+                     "clock": f"{self.clock[0]}+{self.clock[1]}" if self.clock else "-",
+                     "rated": "rated" if first.get("rated") else "casual"}
         log.info("game %s: playing %s vs %s", self.game_id, "white" if my_color else "black", opponent)
         if self.contempt is None:
-            me, them = (first["white"], first["black"]) if my_color else (first["black"], first["white"])
             self.contempt = self.contempt_for(me.get("rating"), them.get("rating"))
             if self.contempt:
                 log.info("game %s: contempt %d (%s vs %s)", self.game_id, self.contempt, me.get("rating"), them.get("rating"))
@@ -506,7 +528,7 @@ class Game(threading.Thread):
                     if event.get("status") != "started":
                         winner = event.get("winner")
                         result = "draw" if not winner else ("win" if (winner == "white") == my_color else "loss")
-                        log.info("game %s: over (%s) result=%s vs %s", self.game_id, event.get("status"), result, opponent)
+                        self.record_result(event.get("status"), result, len(board.move_stack))
                         break
                     timer = self.watch_stall(board, my_color, timer)
                     engine = self.maybe_move(engine, board, my_color, event)
@@ -562,6 +584,24 @@ class Game(threading.Thread):
     def board_from(game_full: dict) -> chess.Board:
         fen = game_full.get("initialFen", "startpos")
         return chess.Board() if fen == "startpos" else chess.Board(fen)
+
+    def record_result(self, status: str | None, result: str, plies: int) -> None:
+        """Logs the outcome with the ratings and appends a line to the results ledger (#64)."""
+        i = self.info
+        log.info("game %s: over (%s) result=%s vs %s [%s vs %s, %s %s %s]", self.game_id, status, result, i.get("opponent"),
+                 i.get("my_rating"), i.get("opp_rating"), i.get("speed"), i.get("clock"), i.get("rated"))
+        path = self.cfg.results_log
+        if not path:
+            return
+        fields = (datetime.datetime.now().astimezone().isoformat(timespec="seconds"), VERSION, self.game_id, i.get("speed"),
+                  i.get("clock"), i.get("rated"), i.get("color"), i.get("opponent"), i.get("opp_rating"), i.get("my_rating"),
+                  result, status, plies)
+        try:
+            Path(path).parent.mkdir(parents=True, exist_ok=True)
+            with open(path, "a", encoding="utf-8") as f:
+                f.write("\t".join("-" if v is None else str(v) for v in fields) + "\n")
+        except OSError as e:
+            log.warning("game %s: could not append to %s (%s)", self.game_id, path, e)
 
     @staticmethod
     def apply_state(board: chess.Board, state: dict) -> None:

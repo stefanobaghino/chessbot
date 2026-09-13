@@ -616,6 +616,8 @@ def make_game():
     g.my_id = "me"
     g.book = None
     g.tablebase = None
+    g.clock = None
+    g.info = {}
     g.client = type("Client", (), {})()
     g.client.bots = FakeBots()
     return g
@@ -714,7 +716,7 @@ def test_play_reconnects_stream_after_transport_error(monkeypatch):
 
     monkeypatch.setattr(time, "sleep", lambda s: None)
     g = make_game()
-    g.cfg = type("Cfg", (), {"engine_path": "x", "engine_hash": 16, "ponder": True, "tablebase": False})()
+    g.cfg = type("Cfg", (), {"results_log": "", "engine_path": "x", "engine_hash": 16, "ponder": True, "tablebase": False})()
     g.new_engine = lambda: LiveEngine()
     g.quit_engine = lambda e: None
     opened = []
@@ -1248,7 +1250,7 @@ def test_tablebase_is_skipped_when_it_does_not_apply():
 
 def test_silent_opponent_is_aborted_before_the_clocks_start():
     g = make_game()
-    g.cfg = type("Cfg", (), {"contempt_per_100": 0.0, "contempt_max": 0, "ponder": False, "tablebase": False, "stall_abort_timeout": 0.05})()
+    g.cfg = type("Cfg", (), {"results_log": "", "contempt_per_100": 0.0, "contempt_max": 0, "ponder": False, "tablebase": False, "stall_abort_timeout": 0.05})()
     g.contempt = 0
     g.quit_engine = lambda e: None
     aborted = threading.Event()
@@ -1392,3 +1394,32 @@ def test_late_acceptance_is_played_when_the_abort_fails(monkeypatch, caplog):
     assert b.games["c1"].started
     assert "game c1: abort failed (HTTP 400)" in caplog.text
     assert "game c1 exceeds MAX_GAMES=1 with 1 running; playing it anyway" in caplog.text
+
+
+def test_game_over_logs_the_ratings_and_appends_a_ledger_line(tmp_path, caplog):
+    import logging
+
+    g = make_game()
+    ledger = tmp_path / "state" / "results.tsv"
+    g.cfg = type("Cfg", (), {"contempt_per_100": 0.0, "contempt_max": 0, "ponder": False, "tablebase": False,
+                             "stall_abort_timeout": 0, "results_log": str(ledger)})()
+    g.quit_engine = lambda e: None
+
+    class Bots(FakeBots):
+        def stream_game_state(self, gid):
+            # We are white and have played e4; the opponent resigns.
+            yield {"type": "gameFull", "white": {"id": "me", "rating": 2600}, "black": {"id": "opp", "name": "opp", "rating": 2450},
+                   "speed": "blitz", "rated": True, "clock": {"initial": 180000, "increment": 2000},
+                   "state": {"moves": "e2e4", "status": "started"}}
+            yield {"type": "gameState", "moves": "e2e4", "status": "resign", "winner": "white"}
+
+    g.client.bots = Bots()
+    with caplog.at_level(logging.INFO, logger="chessbot"):
+        g.play_stream(None)
+    assert "game g1: over (resign) result=win vs opp [2600 vs 2450, blitz 180+2 rated]" in caplog.text
+    fields = ledger.read_text().rstrip("\n").split("\t")
+    assert fields[1:] == ["dev", "g1", "blitz", "180+2", "rated", "white", "opp", "2450", "2600", "win", "resign", "1"]
+    assert fields[0][:2] == "20" and "T" in fields[0]
+    g.cfg.results_log = ""
+    g.record_result("mate", "loss", 40)  # disabled: nothing appended
+    assert ledger.read_text().count("\n") == 1
